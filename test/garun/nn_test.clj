@@ -37,8 +37,8 @@
     (let [source (regression-table)
           before (nn/predict net db source {:x [:x]})
           {:keys [history]} (nn/train! net db source
-                                     {:x [:x] :y :y :epochs 180 :batch 16
-                                      :optim [:adam {:lr 0.05}] :validation source})
+                                       {:x [:x] :y :y :epochs 180 :batch 16
+                                        :optim [:adam {:lr 0.05}] :validation source})
           predictions (nn/predict net db source {:x [:x]})
           truth (mapv :y (table/rows db source))]
       (is (= 41 (count before)))
@@ -141,7 +141,7 @@
     (doseq [optim [[:sgd {:lr 0.05 :momentum 0.5}] [:adamw {:lr 0.05 :weight-decay 0.01}]]]
       (with-open [net (nn/build [:linear {:units 1 :bias? false}] {:input-shape [1]})]
         (let [history (:history (nn/train! net db (regression-table)
-                                         {:x [:x] :y :y :loss :mae :epochs 3 :batch 16 :shuffle? false :optim optim}))]
+                                           {:x [:x] :y :y :loss :mae :epochs 3 :batch 16 :shuffle? false :optim optim}))]
           (is (= 3 (count history)))
           (is (every? #(Double/isFinite (double (:loss %))) history)))))))
 
@@ -160,7 +160,7 @@
 
 (defn- train-seeded-network! [db source]
   (with-open [net (nn/build [:sequential [:linear 3] [:tanh] [:dropout {:p 0.2}] [:linear 1]]
-                           {:input-shape [1] :seed 29})]
+                            {:input-shape [1] :seed 29})]
     (nn/train! net db source {:x [:x] :y :y :epochs 5 :batch 13 :seed 31})))
 
 (deftest seeds-reproduce-initialization-shuffling-and-dropout
@@ -182,7 +182,7 @@
 
 (deftest vector-predictions-use-first-argmax-and-stable-softmax
   (let [source (table/from {:a [0.0 10.0 -1000.0 1000.0]
-                           :b [0.0 10.0 1000.0 -1000.0]})]
+                            :b [0.0 10.0 1000.0 -1000.0]})]
     (with-open [db (table/open)
                 net (nn/build [:identity] {:input-shape [2]})]
       (is (= [[0.0 0.0] [10.0 10.0] [-1000.0 1000.0] [1000.0 -1000.0]]

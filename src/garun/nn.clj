@@ -117,18 +117,18 @@
    :flatten    {:no-args? true :compile (fn [_args _spec] (Blocks/batchFlattenBlock))}
    :batchnorm  {:no-args? true :compile (fn [_args _spec] (.build (BatchNorm/builder)))}
    :layernorm  {:no-args? true :compile (fn [_args _spec]
-                                       (-> (LayerNorm/builder) (.axis (int-array [1])) .build))}})
+                                          (-> (LayerNorm/builder) (.axis (int-array [1])) .build))}})
 
 (defn- compile-block! [spec]
   (when-not (and (vector? spec) (keyword? (first spec)))
     (invalid :nn/invalid-spec "A network block must be a Hiccup vector" {:spec spec}))
   (let [[tag & args] spec
-        {:keys [compile no-args?]} (get block-compilers tag)]
-    (when-not compile
+        {:keys [no-args?] compiler :compile} (get block-compilers tag)]
+    (when-not compiler
       (invalid :nn/unknown-tag "Unknown neural network block" {:tag tag}))
     (when (and no-args? (seq args))
       (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec}))
-    (compile args spec)))
+    (compiler args spec)))
 
 (defn- initialize-network! [spec input-shape seed]
   (let [^Block block (compile-block! spec)
@@ -145,10 +145,10 @@
         (.close model)
         (throw error)))))
 
-(defn ^Network build
+(defn build
   "Build and initialize a CPU Network from Hiccup and {:input-shape [features]}.
   Close it with with-open. Throws ExceptionInfo for invalid specs or options."
-  [spec opts]
+  ^Network [spec opts]
   (let [{:keys [input-shape seed] :or {seed 11}} (options opts #{:input-shape :seed} :build)]
     (when-not (and (vector? input-shape) (= 1 (count input-shape)) (every? positive-int? input-shape))
       (invalid :nn/invalid-input-shape "Input shape must be [positive-feature-count]" {:input-shape input-shape}))
@@ -173,8 +173,8 @@
                (.optMomentum (float momentum)) .build)
       :adam (-> (Optimizer/adam) (.optLearningRateTracker (Tracker/fixed (float lr))) .build)
       :adamw (let [^AdamW$Builder builder (-> (Optimizer/adamW)
-                                            (.optLearningRateTracker (Tracker/fixed (float lr)))
-                                            (.optWeightDecays (float weight-decay)))]
+                                              (.optLearningRateTracker (Tracker/fixed (float lr)))
+                                              (.optWeightDecays (float weight-decay)))]
                (.build builder)))))
 
 (defn- loss-function [loss]
@@ -374,10 +374,10 @@
     (spit (io/file file "spec.edn") (pr-str (select-keys net [:spec :input-shape])))
     nil))
 
-(defn ^Network load
+(defn load
   "Load a saved Network from dir; close it with with-open.
   Throws ExceptionInfo for an invalid saved spec; read/DJL failures propagate."
-  [dir]
+  ^Network [dir]
   (let [file (io/file dir)
         {:keys [spec input-shape]} (options (edn/read-string (slurp (io/file file "spec.edn"))) #{:spec :input-shape} :saved-spec)
         net (build spec {:input-shape input-shape})

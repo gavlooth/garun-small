@@ -28,30 +28,28 @@
       (finally
         (delete-file! path)))))
 
-(deftest inner-and-outer-parameters-follow-sql-text-order
+(deftest nested-bound-values-survive-execution-and-copy
   (with-open [db (table/open)]
     (let [source (table/from {:x [1 2 3] :s ["a" "b" "b"]})
           filtered (table/query source [[:where [:> :x 1]]
                                         [:derive {:z [:+ :x 10]}]
                                         [:where [:= :s "b"]]])
-          [_ & params] (table/->sql filtered)
           expected-rows [{:s "b" :x 2 :z 12} {:s "b" :x 3 :z 13}]]
-      (testing "Projection parameters precede their inner source and WHERE parameters"
-        (is (= [10 "a" 1 "b" 2 "b" 3 1 "b"] params))
+      (testing "Derived values and filters bind correctly across nested clauses"
         (is (= expected-rows (table/rows db filtered))))
-      (testing "COPY materializes the same ordered bound values"
+      (testing "COPY materializes the same bound values"
         (doseq [[format writer] [[:csv table/write-csv!] [:parquet table/write-parquet!]]]
           (is (= expected-rows (:rows (round-trip! db filtered format writer))) (name format)))))))
 
 (deftest copy-preserves-scalar-types-and-escapes-text
   (with-open [db (table/open)]
     (let [source (table/from {:id [1 2]
-                             :large [9007199254740993 Long/MAX_VALUE]
-                             :number [3.125 -4.5]
-                             :flag [true false]
-                             :nullable [nil 7]
-                             :text ["O'Brien? -- not SQL" "a \"quoted\" value"]
-                             :a?b ["first?" "second?"]})
+                              :large [9007199254740993 Long/MAX_VALUE]
+                              :number [3.125 -4.5]
+                              :flag [true false]
+                              :nullable [nil 7]
+                              :text ["O'Brien? -- not SQL" "a \"quoted\" value"]
+                              :a?b ["first?" "second?"]})
           expected-rows [{:id 1 :large 9007199254740993 :number 3.125 :flag true
                           :nullable nil :text "O'Brien? -- not SQL" :a?b "first?"}
                          {:id 2 :large Long/MAX_VALUE :number -4.5 :flag false
@@ -79,7 +77,7 @@
     (let [source (table/from {:x [1]})
           copy-tables (table/from
                        [:duckdb {:query (str "SELECT table_name FROM duckdb_tables() "
-                                            "WHERE temporary AND starts_with(table_name, '__garun_copy_')")}])
+                                             "WHERE temporary AND starts_with(table_name, '__garun_copy_')")}])
           path (temp-path! ".parquet")]
       (try
         (doseq [[format writer] [[:csv table/write-csv!] [:parquet table/write-parquet!]]]
@@ -128,11 +126,11 @@
         (testing "Derived values add or replace columns even when file names are unknown"
           (is (= [{:x 8 :y 3.0 :z 1} {:x 8 :y 4.0 :z 1}]
                  (table/rows db (table/query (table/from [:parquet {:path parquet}])
-                                            [:derive {:x 8 :z 1}])))))
+                                             [:derive {:x 8 :z 1}])))))
         (testing "Every column of an unknown SQL schema can be replaced"
           (is (= [{:x 8}]
                  (table/rows db (table/query (table/from [:duckdb {:query "SELECT 1 AS x"}])
-                                            [:derive {:x 8}]))))))
+                                             [:derive {:x 8}]))))))
       (finally (doseq [p [csv json parquet]] (delete-file! p))))))
 
 (deftest clauses
@@ -149,24 +147,24 @@
              (table/rows db (table/query source [:derive {:x [:+ :x :y]}]))))
       (is (= [{:k "a" :m 1.5 :n 2} {:k "b" :m 3.0 :n 1}]
              (table/rows db (table/query source [[:group-by [:k] {:n [:count] :m [:avg :x]}]
-                                                [:order-by :k]]))))
+                                                 [:order-by :k]]))))
       (is (= [{:x 3} {:x 2}]
              (table/rows db (table/query source [[:where [:> :x 1]] [:order-by [:x :desc :first]]
-                                                [:limit 2] [:select :x]]))))
+                                                 [:limit 2] [:select :x]]))))
       (is (= 2 (table/row-count db (table/query source [:sample {:n 2 :seed 11}]))))
       (is (= (table/rows db (table/query source [:sample {:n 2 :seed 11 :key :x}]))
              (table/rows db (table/query source [:sample {:n 2 :seed 11 :key :x}]))))
       (is (= [1 2 1]
              (mapv :rank (table/rows db (table/query source
-                                                    [[:derive {:rank [:over [:row-number]
-                                                                      {:partition-by [:k] :order-by [[:x :asc]]}]}]
-                                                     [:order-by :x]])))))
+                                                     [[:derive {:rank [:over [:row-number]
+                                                                       {:partition-by [:k] :order-by [[:x :asc]]}]}]
+                                                      [:order-by :x]])))))
       (is (= [1 3 3]
              (mapv :running (table/rows db (table/query source
-                                                       [[:derive {:running [:over [:sum :x]
-                                                                            {:partition-by [:k] :order-by [:x]
-                                                                             :rows [:unbounded :current]}]}]
-                                                        [:order-by :x]]))))))))
+                                                        [[:derive {:running [:over [:sum :x]
+                                                                             {:partition-by [:k] :order-by [:x]
+                                                                              :rows [:unbounded :current]}]}]
+                                                         [:order-by :x]]))))))))
 
 (deftest expressions-and-null-semantics
   (with-open [db (table/open)]
@@ -186,7 +184,7 @@
              (mapv :s (table/rows db (table/query source [:derive {:s [:coalesce [:lower :text] "none"]}])))))
       (is (= [{:distinct 2 :n 2 :total 3}]
              (table/rows db (table/query source [:group-by [] {:n [:count :x] :total [:sum :x]
-                                                              :distinct [:count-distinct :x]}]))))
+                                                               :distinct [:count-distinct :x]}]))))
       (is (= [true true true]
              (mapv :b (table/rows db (table/query source [:derive {:b [:lit true]}])))))
       (is (= [nil 2 1] (mapv :x (table/rows db (table/query source [:order-by [[:x :desc :first]]])))))
@@ -195,6 +193,152 @@
                                [[:= [:/ :x 2] 1] [2]] [[:= [:% :x 2] 1] [1]]
                                [[:= [:col "x"] 1] [1]]]]
         (is (= expected (xs expr)))))))
+
+(deftest expression-scalars-preserve-types-and-null-comparisons
+  (with-open [db (table/open)]
+    (let [source (table/from {:x [1 2 nil]})
+          result (table/query source
+                              [[:derive {:large [:+ :x 9007199254740993]
+                                         :single [:* [:cast :x :float32] (float 1.25)]
+                                         :flag [:and true [:> :x 1]]
+                                         :equal [:= :x nil]
+                                         :equal-left [:= nil :x]
+                                         :different [:!= :x nil]
+                                         :missing [:is-null :x]}]
+                               [:select :large :single :flag :equal :equal-left :different :missing]])]
+      (is (= [{:large 9007199254740994 :single (float 1.25) :flag false
+               :equal nil :equal-left nil :different nil :missing false}
+              {:large 9007199254740995 :single (float 2.5) :flag true
+               :equal nil :equal-left nil :different nil :missing false}
+              {:large nil :single nil :flag nil
+               :equal nil :equal-left nil :different nil :missing true}]
+             (table/rows db result)))
+      (is (= [{:name "large" :type :int64}
+              {:name "single" :type :float32}
+              {:name "flag" :type :bool}
+              {:name "equal" :type :bool}
+              {:name "equal-left" :type :bool}
+              {:name "different" :type :bool}
+              {:name "missing" :type :bool}]
+             (table/schema db result))))))
+
+(deftest literal-identifier-names-survive-clauses-and-joins
+  (with-open [db (table/open)]
+    (doseq [column ["part.value" "dash-name" "quote\"name" "question?mark"
+                    "literal/slash" "select" "*" "x); DROP TABLE victims; --"]]
+      (let [renamed (str "renamed." column)
+            aggregate (str column "?total")
+            source (table/from {column [2 1 2] "discard" [8 9 10]})]
+        (testing (str "Literal name through select, replacement, rename, group and order: " column)
+          (is (= [{(keyword renamed) 12 (keyword aggregate) 24}
+                  {(keyword renamed) 11 (keyword aggregate) 11}]
+                 (table/rows db
+                             (table/query source
+                                          [[:select column]
+                                           [:derive {column [:+ [:col column] 10]}]
+                                           [:rename {column renamed}]
+                                           [:group-by [renamed] {aggregate [:sum [:col renamed]]}]
+                                           [:order-by [renamed :desc]]])))))
+        (testing (str "Join keys and collision aliases remain literal names: " column)
+          (let [right (table/from {column [2 3] "payload" [20 30]})
+                joined (table/query source
+                                    [[:join right {:on [column]}]
+                                     [:select column (str column "_right") "payload"]
+                                     [:group-by [column (str column "_right")]
+                                      {"matched" [:sum :payload]}]])]
+            (is (= [{(keyword column) 2 (keyword (str column "_right")) 2 :matched 40}]
+                   (table/rows db joined)))))))))
+
+(deftest chained-projections-bind-both-join-inputs
+  (with-open [db (table/open)]
+    (let [left (table/query
+                (table/from {:id [1 2 3] :text ["left's ?" "keep?" "also keep"] :x [2 4 8]})
+                [[:where [:> :id 1]]
+                 [:derive {:shift [:+ :x 10]}]
+                 [:select :id :shift :text]
+                 [:derive {:result [:* :shift 3]}]
+                 [:select :id :result :text]
+                 [:where [:< :result 60]]])
+          right (table/query
+                 (table/from {:rid [2 3 4] :value [5 6 7]})
+                 [[:derive {:adjusted [:+ :value 100]}]
+                  [:where [:< :rid 4]]
+                  [:select :rid :adjusted]
+                  [:derive {:score [:- :adjusted 7]}]
+                  [:select :rid :score]])
+          joined (table/query left
+                              [[:join right {:on {:id :rid}}]
+                               [:derive {:combined [:+ [:+ :result :score] 1000]}]
+                               [:where [:> :combined 1100]]
+                               [:select :id :text :combined]
+                               [:order-by :id]])]
+      (is (= [{:id 2 :text "keep?" :combined 1140}
+              {:id 3 :text "also keep" :combined 1153}]
+             (table/rows db joined))))))
+
+(deftest native-honeysql-transformations-compose-with-garun
+  (with-open [db (table/open)]
+    (let [source (table/from {:category ["a" "a" "b"]
+                              :amount [1 2 4]
+                              :nullable [nil "x" nil]})]
+      (testing "Native CASE expressions bind text and NULL equality uses HoneySQL semantics"
+        (let [result (table/query source
+                                  [[:where [:> :amount 1]]
+                                   [:honeysql {:select [:amount [[:case [:>= :amount 4] "O'Brien?"
+                                                                  :else "small"] :band]]
+                                               :where [:= :nullable nil]}]
+                                   [:derive {:doubled [:* :amount 2]}]
+                                   [:select :amount :band :doubled]])]
+          (is (= [{:amount 4 :band "O'Brien?" :doubled 8}] (table/rows db result)))
+          (is (= [{:amount 4 :band "O'Brien?" :doubled 8}]
+                 (:rows (round-trip! db result :parquet table/write-parquet!))))))
+      (testing "WHERE-only transformations retain the input projection"
+        (is (= [{:category "a" :amount 2 :nullable "x"}]
+               (table/rows db (table/query source [:honeysql {:where [:= :amount 2]}])))))
+      (testing "Native DISTINCT replaces the default SELECT rather than duplicating it"
+        (is (= [{:category "a"} {:category "b"}]
+               (table/rows db
+                           (table/query source [:honeysql {:select-distinct [:category]
+                                                           :order-by [[:category :asc]]}])))))
+      (testing "Native HAVING and aggregates remain composable with Garun clauses"
+        (is (= [{:category "b" :total 4}]
+               (table/rows db
+                           (table/query source
+                                        [[:honeysql {:select [:category [[:sum :amount] :total]]
+                                                     :group-by [:category]
+                                                     :having [:> [:sum :amount] 3]}]
+                                         [:where [:> :total 3]]]))))))))
+
+(deftest native-honeysql-transformations-reject-source-replacement-and-statements
+  (let [source (table/from {:amount [1 2]})]
+    (doseq [clause [[:honeysql] [:honeysql nil] [:honeysql {} {}]]]
+      (is (= :table/invalid (error-code #(table/query source clause)))))
+    (doseq [transformation [{:from [:other]}
+                            {:delete-from :__input__}
+                            {:create-table-as :other :select [:*]}
+                            {:update :__input__ :set {:amount 0}}]]
+      (is (= :table/unknown-option
+             (error-code #(table/query source [:honeysql transformation])))))))
+
+(deftest finite-window-frames-respect-bounds-and-partitions
+  (with-open [db (table/open)]
+    (let [source (table/from {:partition ["a" "b" "a" "b" "a" "a"]
+                              :position [1 1 2 2 3 4]
+                              :x [1 10 2 20 4 8]})]
+      (doseq [[frame expected] [[[-1 1] [3 7 14 12 30 30]]
+                                [[-2 :current] [1 3 7 14 10 30]]
+                                [[:current 2] [7 14 12 8 30 20]]
+                                [[0 0] [1 2 4 8 10 20]]]]
+        (testing (str "ROWS frame " frame)
+          (is (= expected
+                 (mapv :total
+                       (table/rows db
+                                   (table/query source
+                                                [[:derive {:total [:over [:sum :x]
+                                                                   {:partition-by [:partition]
+                                                                    :order-by [:position]
+                                                                    :rows frame}]}]
+                                                 [:order-by :partition :position]]))))))))))
 
 (deftest join-types-and-collisions
   (with-open [db (table/open)]
@@ -216,12 +360,12 @@
              (table/rows db (table/query left [:join (table/from {:k [2] :z [20]}) {:on {:id :k}}]))))
       (is (= [{:id 2 :v "b" :id_right 2}]
              (table/rows db (table/query left
-                                        [:join (table/from [:duckdb {:query "SELECT 2 AS id"}])
-                                         {:on [:id]}]))))
+                                         [:join (table/from [:duckdb {:query "SELECT 2 AS id"}])
+                                          {:on [:id]}]))))
       (is (= [{:id 2 :v "b" :id_right 2 :z 20}]
              (table/rows db (table/query left
-                                        [:join (table/from [:duckdb {:query "SELECT 2 AS id, 20 AS z"}])
-                                         {:on [:id]}])))))))
+                                         [:join (table/from [:duckdb {:query "SELECT 2 AS id, 20 AS z"}])
+                                          {:on [:id]}])))))))
 
 (deftest deterministic-covering-splits
   (with-open [db (table/open)]
@@ -237,7 +381,7 @@
       (is (= 200 (count (distinct (apply concat parts)))))
       (is (= 200 (count (apply concat no-key))))
       (is (= no-key (mapv #(mapv :id (table/rows db %))
-                         (table/query source [:split {:fractions [0.5 0.5] :seed 3}])))))))
+                          (table/query source [:split {:fractions [0.5 0.5] :seed 3}])))))))
 
 (deftest split-helpers-do-not-shadow-user-columns
   (with-open [db (table/open)]

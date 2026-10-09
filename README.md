@@ -2,8 +2,8 @@
 
 A small JVM Clojure version of the Garun Hiccup DSL. It has two backends:
 
-- **DuckDB** (plain JDBC) for tables. It uses Garun's table clause DSL, which
-  `garun.table` renders to SQL with bound parameters (no SQL-builder library).
+- **DuckDB** (plain JDBC) for tables. Garun clauses become HoneySQL query data;
+  HoneySQL renders SQL and bound parameters at execution time.
 - **Deep Java Library 0.36 / PyTorch 2.7.1 CPU** for dense neural networks.
 
 Left out on purpose: the Rust engine, classical estimators
@@ -33,11 +33,32 @@ at runtime.
 `[:parquet {:path}]`, `[:json {:path}]`, or `[:duckdb {:query "SELECT …"}]`.
 The `:duckdb` query is trusted SQL.
 
-**Clauses:** `:select :rename :where :derive :group-by :order-by :limit :join :sample :split`.
+**Clauses:** `:select :rename :where :derive :group-by :order-by :limit :join :sample :split :honeysql`.
 `:split` must be the last clause. It returns a vector of tables that are
 deterministic, do not overlap and together cover every input row.
 
 **Expressions:** Garun's operators, aggregates and window functions (`[:over expr {...}]`).
+
+Use `[:honeysql clause-map]` for native HoneySQL SELECT transformations. Garun
+supplies `FROM` from the previous table and defaults to `SELECT *` when no
+projection is supplied. Supported clauses include projections (including
+DISTINCT), WHERE, grouping/HAVING, windows/QUALIFY, ordering, limits/offsets,
+joins and CTEs. Source replacement and DDL/DML clause keys are rejected.
+HoneySQL helpers can build the same clause maps.
+
+```clojure
+(table/query data
+  [[:where [:not-null :amount]]
+   [:honeysql {:select [:category [[:sum :amount] :total]]
+               :group-by [:category]
+               :having [:> [:sum :amount] 10]}]
+   [:order-by [:total :desc]]])
+```
+
+Inside `:honeysql`, expressions follow HoneySQL's identifier and NULL rules:
+`[:= :x nil]` means `IS NULL`, unlike Garun's bound NULL equality. `:raw` forms
+are trusted SQL, not sanitized input. Arbitrary projection names are resolved
+by DuckDB; a later Garun `:select` can explicitly name the output columns.
 
 **Layers:** `:sequential :linear :activation :relu :tanh :sigmoid :gelu :identity
 :dropout :batchnorm :layernorm :flatten :parallel :skip`.

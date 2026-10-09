@@ -43,3 +43,20 @@ Signature: omp/claude-opus-5-5
 - **Next actions:** none pending. Possible later work: a `:graph` form on FnBlock, embeddings.
 
 Signature: omp/claude-opus-5-5
+
+## 2026-10-09 — HoneySQL AST cutover and native table transformations
+
+- **Objective/workspace:** In `/home/heefoo/Documents/code/garun-small`, save the existing implementation, then restore HoneySQL to remove bespoke SQL construction. User additionally requested native HoneySQL transformations.
+- **Checkpoint:** Git was already initialized and colocated with jj. Reinitialized Git idempotently; preserved existing history and created `pre-honeysql` at `0fe5bcd3` before source changes. Ignored `.clj-kondo/.cache/` and `.lsp/.cache/`; untracked generated cache files accidentally captured during the initial snapshot.
+- **Changes:** HoneySQL 2.7.1392 now owns standard SQL formatting and ordered parameters. Plans hold `:query` AST maps; removed `fragment`, `combine-sql` and manual parameter accumulation. Retained four small extensions for literal identifiers, DuckDB file options, struct fields and COPY. JDBC still executes through bound statements, and COPY still uses bound CTAS followed by cleanup.
+- **Native transformations:** `[:honeysql clause-map]` composes SELECT-compatible HoneySQL clauses with Garun transformations. The prior table supplies FROM; arbitrary source replacement and DDL/DML keys are rejected. Native expressions retain HoneySQL conventions, including NULL comparisons and explicit trusted `:raw` forms. README documents usage and the boundary.
+- **Coverage:** 100% of this cutover and native-transformation scope. Basis: existing public DSL regression cases pass; added executable identifier, scalar-type, NULL, joined-parameter, finite-window and native CASE/DISTINCT/HAVING/composition/error cases.
+- **Size:** `table.clj` changed from 709 to 684 lines for the renderer cutover, then to 699 with native HoneySQL transformations. Net reduction is only 10 lines (1.4%); the substantive simplification is deleting custom SQL/parameter composition, not a large total code reduction.
+- **Commands:** `git init`; `jj file untrack .clj-kondo/.cache`; `jj describe`; `jj bookmark create pre-honeysql -r @`; `jj new`; `clojure -M:test`; end-to-end throwaway smoke using `clojure -M /tmp/garun-honeysql-smoke.clj`; `cljfmt fix/check`; `clj-kondo --lint src test build.clj deps.edn`; Eastwood 1.4.3 via `clojure -Sdeps` with src/test/target/classes paths; Kibit 0.1.11 via temporary CLI dependencies; reflection reload check.
+- **Results:** 40 tests, 426 assertions, zero failures/errors. Formatting clean; clj-kondo zero warnings/errors; Eastwood zero warnings/exceptions; zero reflection warnings. Smoke: 200 generated CSV rows → Garun derive → native HoneySQL projection/filter → keyed split → parquet → residual/parallel BCE network → save/load. Train/test rows 162/38; loss 0.6066505725 → 0.00018357975; test accuracy 1.0; exact parquet and saved-model prediction round-trips.
+- **Lint detail:** Corrected preexisting Network return-hint placement and a local `compile` shadow; formatting-only NN/test changes. Kibit initially suggested four changes; applied the relevant nested-assoc → assoc-in simplification. Other suggestions concern unchanged metric/test formulas and are advisory, not defects.
+- **Negative memory:** A generated temporary-table name as a string works in CTAS but HoneySQL DROP rejects it and prevents cleanup; use one generated keyword consistently. Targeted tests and Eastwood also need `test` explicitly on the classpath, not merely in scanner paths. HoneySQL ordinary identifier formatting treats `*` specially, so literal Garun names require the small quoted-identifier extension.
+- **Unresolved issues:** None in the exercised cutover. Native HoneySQL `:raw` is intentionally trusted, not a SQL security sandbox. No performance improvement was measured or claimed.
+- **Recommendation/next action:** Keep the AST cutover as a separately saved milestone. The user's next request is autonomous expansion across DJL capabilities, preserving minimal dependencies and readable code.
+
+Signature: omp/gpt-6.1-sol

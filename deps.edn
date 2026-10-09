@@ -1,5 +1,6 @@
 {:paths ["src" "target/classes"]
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        com.github.seancorfield/honeysql {:mvn/version "2.7.1392"}
         org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}
         ai.djl/api {:mvn/version "0.36.0"}
         ai.djl.pytorch/pytorch-engine {:mvn/version "0.36.0"}

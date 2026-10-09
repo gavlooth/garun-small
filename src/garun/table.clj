@@ -1,13 +1,14 @@
 (ns garun.table
   "Immutable Garun table plans executed through DuckDB JDBC.
 
-  A plan holds SQL text and its ordered parameters; each clause selects from the
-  previous plan as __input__. Nothing runs until a connection is supplied. This
-  small renderer owns DuckDB-specific syntax, quotes identifiers, and binds DSL
-  values. Only [:duckdb {:query ...}] accepts trusted SQL text. COPY cannot bind
-  parameters, so exports materialize the bound query in a temporary table and
-  escape only the output path; the temporary table is always dropped."
-  (:require [clojure.string :as str])
+  A plan holds a HoneySQL :query map; each clause selects from the previous
+  plan as __input__. Nothing runs until a connection is supplied. Scalar DSL
+  values are lifted parameters, including NULL, numbers and booleans. Only
+  [:duckdb {:query ...}] accepts trusted SQL. Local HoneySQL extensions handle
+  literal identifiers (including '*'), DuckDB named arguments and COPY paths.
+  COPY materializes a bound query in a temporary table that is always dropped."
+  (:require [clojure.string :as str]
+            [honey.sql :as sql])
   (:import [java.sql Connection DriverManager PreparedStatement ResultSet ResultSetMetaData]
            [java.util UUID]))
 
@@ -31,8 +32,34 @@
       (invalid! [:column] "Column names must be nonempty keywords or strings without NUL" column))
     text))
 
-(defn- quote-name [column]
-  (str "\"" (str/replace (column-name column) "\"" "\"\"") "\""))
+(defn- identifier [column]
+  [:garun/identifier (column-name column)])
+
+;; HoneySQL's entity formatter interprets '*' as a wildcard, even in aliases.
+;; Garun names are always literal; qualification and wildcards are separate ASTs.
+(sql/register-fn! :garun/identifier
+                  (fn [_ [text]]
+                    [(str "\"" (str/replace text "\"" "\"\"") "\"")]))
+
+(defn- named-argument [op [column value]]
+  (let [[value-sql & params] (sql/format-expr value)
+        [column-sql] (sql/format-expr column)]
+    (into [(str column-sql (if (= :garun/struct-field op) " := " " = ") value-sql)]
+          params)))
+
+(sql/register-fn! :garun/file-option named-argument)
+
+(sql/register-fn! :garun/struct-field named-argument)
+
+;; DuckDB COPY does not accept bound paths. Only this extension escapes a
+;; validated output path; the query itself is bound through CREATE TABLE AS.
+(sql/register-clause!
+ :garun/copy
+ (fn [_ [table-name path format]]
+   [(str "COPY " (sql/format-entity table-name) " TO '"
+         (str/replace path "'" "''") "' (FORMAT " format
+         (when (= "CSV" format) ", HEADER TRUE") ")")])
+ nil)
 
 (defn- distinct-names! [columns]
   (when-not (= (count columns) (count (distinct (map str/lower-case columns))))
@@ -43,32 +70,22 @@
   (when-not (= (count args) expected)
     (invalid! [op] "Wrong expression or clause arity" args)))
 
-(defn- combine-sql [prefix separator suffix pieces]
-  {:sql (str prefix (str/join separator (map :sql pieces)) suffix)
-   :params (vec (mapcat :params pieces))})
-
-(defn- fragment [& parts]
-  (combine-sql "" "" ""
-               (map #(if (string? %) {:sql % :params []} %) parts)))
-
 (defn- literal [value]
   (when-not (or (nil? value) (number? value) (string? value) (boolean? value))
     (invalid! [:literal] "Expected a scalar literal" value))
-  {:sql "?" :params [value]})
+  [:lift value])
 
 (def ^:private sql-types
-  {:bool "BOOLEAN" :boolean "BOOLEAN" :int8 "TINYINT" :int16 "SMALLINT" :int32 "INTEGER"
-   :int64 "BIGINT" :i64 "BIGINT" :uint8 "UTINYINT" :uint16 "USMALLINT" :uint32 "UINTEGER"
-   :uint64 "UBIGINT" :float32 "FLOAT" :f32 "FLOAT" :float64 "DOUBLE" :f64 "DOUBLE"
-   :string "VARCHAR" :binary "BLOB" :date "DATE" :timestamp "TIMESTAMP"})
+  {:bool :boolean :boolean :boolean :int8 :tinyint :int16 :smallint :int32 :integer
+   :int64 :bigint :i64 :bigint :uint8 :utinyint :uint16 :usmallint :uint32 :uinteger
+   :uint64 :ubigint :float32 :float :f32 :float :float64 :double :f64 :double
+   :string :varchar :binary :blob :date :date :timestamp :timestamp})
 
 (def ^:private binary-ops
-  {:= "=" :not= "<>" :!= "<>" :> ">" :>= ">=" :< "<" :<= "<="
-   :+ "+" :- "-" :* "*" :/ "/" :% "%" :like "LIKE" :ilike "ILIKE"})
+  #{:= :not= :!= :> :>= :< :<= :+ :- :* :/ :% :like :ilike})
 
 (def ^:private unary-ops
-  {:not ["(NOT " ")"] :is-null ["(" " IS NULL)"]
-   :not-null ["(" " IS NOT NULL)"] :count-distinct ["count(DISTINCT " ")"]})
+  #{:not :is-null :not-null :count-distinct})
 
 (def ^:private function-ops
   {:sum ["sum" 1] :avg ["avg" 1] :min ["min" 1] :max ["max" 1]
@@ -92,20 +109,19 @@
   (when (and (vector? item) (not (<= 1 (count item) 3)))
     (invalid! [:order-by] "Order item is [column direction nulls]" item))
   (let [[column direction nulls] (if (vector? item)
-                                  [(first item) (get item 1 :asc) (get item 2 :last)]
-                                  [item :asc :last])]
+                                   [(first item) (get item 1 :asc) (get item 2 :last)]
+                                   [item :asc :last])]
     (when-not (#{:asc :desc} direction)
       (invalid! [:order-by] "Invalid direction" direction))
     (when-not (#{:first :last} nulls)
       (invalid! [:order-by] "Invalid null ordering" nulls))
-    (fragment (quote-name column) " " (str/upper-case (name direction))
-              " NULLS " (str/upper-case (name nulls)))))
+    [(identifier column) (keyword (str (name direction) "-nulls-" (name nulls)))]))
 
 (defn- frame-bound [bound start?]
   (cond
-    (= :unbounded bound) (if start? "UNBOUNDED PRECEDING" "UNBOUNDED FOLLOWING")
-    (= :current bound) "CURRENT ROW"
-    (integer? bound) (str (abs bound) (if (neg? bound) " PRECEDING" " FOLLOWING"))
+    (= :unbounded bound) (if start? :unbounded-preceding :unbounded-following)
+    (= :current bound) :current-row
+    (integer? bound) [(literal (abs bound)) (if (neg? bound) :preceding :following)]
     :else (invalid! [:window :rows] "Invalid window frame bound" bound)))
 
 (defn- window-spec [opts]
@@ -118,88 +134,11 @@
       (invalid! [:window] "Partition and order must be vectors" opts))
     (when (and frame? (or (empty? order) (not (and (vector? frame) (= 2 (count frame))))))
       (invalid! [:window :rows] "Ordered frame must be [start end]" frame))
-    (fragment
-     (if (seq partition)
-       (combine-sql "PARTITION BY " ", " " " (map #(fragment (quote-name %)) partition)) "")
-     (if (seq order) (combine-sql "ORDER BY " ", " " " (map order-item order)) "")
-     (if frame?
-       (str "ROWS BETWEEN " (frame-bound (first frame) true) " AND " (frame-bound (second frame) false))
-       ""))))
-
-(defn- expression-kind [expr]
-  (let [op (when (vector? expr) (first expr))]
-    (cond
-      (keyword? expr) ::column
-      (not (vector? expr)) ::literal
-      (contains? binary-ops op) ::binary
-      (contains? unary-ops op) ::unary
-      (contains? function-ops op) ::function
-      :else op)))
-
-(defmulti ^:private expression expression-kind)
-
-(defmethod expression ::column [column]
-  (fragment (quote-name column)))
-
-(defmethod expression ::literal [value]
-  (literal value))
-
-(defmethod expression :col [[op & args]]
-  (arity! op args 1)
-  (fragment (quote-name (first args))))
-
-(defmethod expression :lit [[op & args]]
-  (arity! op args 1)
-  (literal (first args)))
-
-(defmethod expression ::binary [[op & args]]
-  (arity! op args 2)
-  (combine-sql "(" (str " " (get binary-ops op) " ") ")" (map expression args)))
-
-(defmethod expression ::unary [[op & args]]
-  (arity! op args 1)
-  (let [[prefix suffix] (get unary-ops op)]
-    (combine-sql prefix "" suffix [(expression (first args))])))
-
-(defn- boolean-expression [op args]
-  (when (empty? args)
-    (invalid! [op] "Boolean operator needs operands" (into [op] args)))
-  (combine-sql "(" (if (= :and op) " AND " " OR ") ")" (map expression args)))
-
-(defmethod expression :and [[op & args]]
-  (boolean-expression op args))
-
-(defmethod expression :or [[op & args]]
-  (boolean-expression op args))
-
-(defmethod expression :in [[op & args :as expr]]
-  (arity! op args 2)
-  (when-not (vector? (second args))
-    (invalid! [op] "IN requires a literal vector" expr))
-  (if (empty? (second args))
-    (fragment "FALSE")
-    (fragment "(" (expression (first args)) " IN "
-              (combine-sql "(" ", " ")" (map literal (second args))) ")")))
-
-(defmethod expression :between [[op & args]]
-  (arity! op args 3)
-  (fragment "(" (expression (first args)) " BETWEEN " (expression (second args))
-            " AND " (expression (nth args 2)) ")"))
-
-(defmethod expression :cast [[op & args]]
-  (arity! op args 2)
-  (when-not (contains? sql-types (second args))
-    (invalid! [op] "Unsupported cast type" (second args)))
-  (fragment "CAST(" (expression (first args)) " AS " (get sql-types (second args)) ")"))
-
-(defmethod expression :count [[op & args]]
-  (when (> (count args) 1)
-    (invalid! [op] "COUNT takes zero or one argument" args))
-  (fragment "count(" (if (seq args) (expression (first args)) "*") ")"))
-
-(defmethod expression :over [[op & args]]
-  (arity! op args 2)
-  (fragment (expression (first args)) " OVER (" (window-spec (second args)) ")"))
+    (cond-> {}
+      (seq partition) (assoc :partition-by (mapv #(vector (identifier %)) partition))
+      (seq order) (assoc :order-by (mapv order-item order))
+      frame? (assoc :frame [:rows :between (frame-bound (first frame) true)
+                            (frame-bound (second frame) false)]))))
 
 (defn- literal-value [value]
   (if (and (vector? value) (= :lit (first value)) (= 2 (count value)))
@@ -223,22 +162,66 @@
         (when-not (and (integer? size) (pos? size))
           (invalid! [op] "Reservoir size must be positive" size))))))
 
-(defmethod expression ::function [[op & args]]
-  (let [[function arity] (get function-ops op)]
-    (function-arguments! op args arity)
-    (combine-sql (str function "(") ", " ")" (map expression args))))
-
-(defmethod expression :default [[op]]
-  (throw (ex-info "Unknown expression operator" {:error :table/unknown-operator :operator op})))
+(defn- expression [expr]
+  (cond
+    (keyword? expr) (identifier expr)
+    (not (vector? expr)) (literal expr)
+    :else
+    (let [[op & args] expr
+          arity (cond
+                  (or (contains? binary-ops op) (#{:in :cast :over} op)) 2
+                  (or (contains? unary-ops op) (#{:col :lit} op)) 1
+                  (= :between op) 3)]
+      (when arity (arity! op args arity))
+      (cond
+        (contains? binary-ops op) (into [op] (map expression args))
+        (contains? function-ops op)
+        (let [[function arity] (get function-ops op)]
+          (function-arguments! op args arity)
+          (into [(keyword function)] (map expression args)))
+        :else
+        (case op
+          :col (identifier (first args))
+          :lit (literal (first args))
+          :not [:not (expression (first args))]
+          :is-null [:is (expression (first args)) nil]
+          :not-null [:is-not (expression (first args)) nil]
+          :count-distinct [:count [:distinct (expression (first args))]]
+          (:and :or)
+          (do
+            (when (empty? args)
+              (invalid! [op] "Boolean operator needs operands" expr))
+            (into [op] (map expression args)))
+          :in
+          (do
+            (when-not (vector? (second args))
+              (invalid! [op] "IN requires a literal vector" expr))
+            (if (empty? (second args))
+              (literal false)
+              [:in (expression (first args)) (mapv literal (second args))]))
+          :between (into [:between] (map expression args))
+          :cast
+          (do
+            (when-not (contains? sql-types (second args))
+              (invalid! [op] "Unsupported cast type" (second args)))
+            [:cast (expression (first args)) (get sql-types (second args))])
+          :count
+          (do
+            (when (> (count args) 1)
+              (invalid! [op] "COUNT takes zero or one argument" args))
+            [:count (if (seq args) (expression (first args)) :*)])
+          :over [:over [(expression (first args)) (window-spec (second args))]]
+          (throw (ex-info "Unknown expression operator"
+                          {:error :table/unknown-operator :operator op})))))))
 
 (defn table?
-  "Return whether x is a Garun table plan with SQL and an ordered parameter vector."
+  "Return whether x is a Garun table plan with a HoneySQL query map."
   [x]
-  (and (map? x) (= :garun/table (:type x)) (string? (:sql x)) (vector? (:params x))))
+  (and (map? x) (= :garun/table (:type x)) (map? (:query x))))
 
-(defn- plan [piece columns]
-  (with-meta (assoc piece :type :garun/table)
-    (assoc (meta piece) ::columns columns)))
+(defn- plan [query columns]
+  (with-meta {:type :garun/table :query query}
+    {::columns columns}))
 
 (defn- names [table]
   (::columns (meta table)))
@@ -261,12 +244,11 @@
       (when (empty? columns)
         (invalid! [:source] "Source requires at least one named column" source))
       (if (seq rows)
-        (plan (fragment "SELECT * FROM (VALUES "
-                        (combine-sql "" ", " "" (map #(combine-sql "(" ", " ")" (map literal %)) rows))
-                        ") AS __input__(" (str/join ", " (map quote-name columns)) ")") columns)
-        (plan (fragment (combine-sql "SELECT " ", " ""
-                                    (map #(fragment (literal nil) " AS " (quote-name %)) columns))
-                        " WHERE FALSE") columns)))))
+        (plan {:select [:*]
+               :from [[{:values (mapv #(mapv literal %) rows)}
+                       [:__input__ (mapv identifier columns)]]]} columns)
+        (plan {:select (mapv #(vector (literal nil) [(identifier %)]) columns)
+               :where (literal false)} columns)))))
 
 (def ^:private source-options
   {:csv [:path :header? :delimiter] :parquet [:path] :json [:path] :duckdb [:query]})
@@ -290,13 +272,14 @@
   (arity! :source source 2)
   (source-options! tag opts)
   (if (= :duckdb tag)
-    (plan (fragment "SELECT * FROM (" (:query opts) ") AS __input__") nil)
-    (plan (fragment "SELECT * FROM "
-                    (get {:csv "read_csv_auto(" :parquet "read_parquet(" :json "read_json_auto("} tag)
-                    (literal (:path opts))
-                    (if (contains? opts :header?) (fragment ", header=" (literal (:header? opts))) "")
-                    (if (contains? opts :delimiter) (fragment ", delim=" (literal (:delimiter opts))) "")
-                    ")") nil)))
+    (plan {:select [:*] :from [[[:nest [:raw (:query opts)]] :__input__]]} nil)
+    (let [function (get {:csv :read_csv_auto :parquet :read_parquet :json :read_json_auto} tag)
+          args (cond-> [(literal (:path opts))]
+                 (contains? opts :header?)
+                 (conj [:garun/file-option (identifier :header) (literal (:header? opts))])
+                 (contains? opts :delimiter)
+                 (conj [:garun/file-option (identifier :delim) (literal (:delimiter opts))]))]
+      (plan {:select [:*] :from [[(into [function] args)]]} nil))))
 
 (defn from
   "Build a pure table plan from columns, rows, a file descriptor or trusted SQL.
@@ -311,14 +294,11 @@
     (vector? source) (descriptor-source source)
     :else (invalid! [:source] "Unsupported table source" source)))
 
-(defn- input-sql [table]
-  (fragment "(" table ") AS __input__"))
-
-(defn- select-sql [table projection]
-  (fragment "SELECT " projection " FROM " (input-sql table)))
+(defn- select-query [table projection]
+  {:select projection :from [[(:query table) :__input__]]})
 
 (defn- aliased-expression [[column expr]]
-  (fragment (expression expr) " AS " (quote-name column)))
+  [(expression expr) [(identifier column)]])
 
 (defn- join-keys [on]
   (let [pairs (cond (map? on) (sort-by #(column-name (first %)) on)
@@ -330,7 +310,7 @@
     pairs))
 
 (def ^:private join-types
-  {:inner "INNER JOIN" :left "LEFT JOIN" :right "RIGHT JOIN" :full "FULL JOIN" :cross "CROSS JOIN"})
+  {:inner :join :left :left-join :right :right-join :full :full-join :cross :cross-join})
 
 (defn- join-options! [opts how suffix pairs]
   (when-not (or (#{:semi :anti} how) (contains? join-types how))
@@ -343,31 +323,30 @@
     (invalid! [:join :on] "Cross join cannot have keys" (:on opts))))
 
 (defn- join-condition [[left right]]
-  (fragment "__input__." (quote-name left) " = __right__." (quote-name right)))
-
-(defn- right-column [[column alias]]
-  (fragment "__right__." (quote-name column) " AS " (quote-name alias)))
+  [:= [:. :__input__ (identifier left)] [:. :__right__ (identifier right)]])
 
 (defn- join-projection [left right aliases pairs suffix left-only?]
   (let [right-keys (distinct (map (comp column-name second) pairs))]
     (cond
-      left-only? (fragment "__input__.*")
+      left-only? [:__input__.*]
       (and left right)
-      (combine-sql "__input__.*, " ", " "" (map right-column (map vector right aliases)))
+      (into [:__input__.*]
+            (map (fn [column alias] [[:. :__right__ (identifier column)] [(identifier alias)]])
+                 right aliases))
       (seq right-keys)
-      (combine-sql "__input__.*, __right__.* RENAME (" ", " ")"
-                   (map #(fragment (quote-name %) " AS " (quote-name (str % suffix))) right-keys))
-      :else (fragment "__input__.*, __right__.*"))))
+      [:__input__.*
+       [:__right__.* {:rename (mapv #(vector (identifier %) [(identifier (str % suffix))]) right-keys)}]]
+      :else [:__input__.* :__right__.*])))
 
-(defn- joined-sql [table other how projection condition]
-  (let [left (select-sql table projection)
-        right (fragment "(" other ") AS __right__")]
+(defn- joined-query [table other how projection condition]
+  (let [left (select-query table projection)
+        right [(:query other) :__right__]]
     (cond
       (#{:semi :anti} how)
-      (fragment left (if (= :semi how) " WHERE EXISTS (" " WHERE NOT EXISTS (")
-                "SELECT 1 FROM " right " WHERE " condition ")")
-      (= :cross how) (fragment left " CROSS JOIN " right)
-      :else (fragment left " " (get join-types how) " " right " ON " condition))))
+      (assoc left :where [(if (= :semi how) :exists :not-exists)
+                          {:select [[(literal 1)]] :from [right] :where condition}])
+      (= :cross how) (assoc left :cross-join [right])
+      :else (assoc left (get join-types how) [right condition]))))
 
 (defn- join-plan [table source opts]
   (options! :join opts [:on :how :suffix])
@@ -386,8 +365,8 @@
                        (and left right) (distinct-names! (into left aliases))
                        :else nil)
           projection (join-projection left right aliases pairs suffix left-only?)
-          condition (combine-sql "(" " AND " ")" (map join-condition pairs))]
-      (plan (joined-sql table other how projection condition) output))))
+          condition (into [:and] (map join-condition pairs))]
+      (plan (joined-query table other how projection condition) output))))
 
 (defn- seeded-key [opts]
   (if (contains? opts :key)
@@ -406,15 +385,18 @@
       (invalid! [:split :seed] "Seed must be an integer" seed))))
 
 (defn- bucketed-input [table opts]
-  (let [bucket (fragment "(hash(" (seeded-key opts) ", " (literal (get opts :seed 0)) ") % 1000000000)")]
-    ;; Nest the original row in a struct: helper columns then cannot shadow user
-    ;; columns, including columns of file/SQL sources whose names are unknown.
-    (select-sql table (fragment "__input__ AS __garun_row__, " bucket " AS __garun_bucket__"))))
+  ;; Nest the original row in a struct so helpers cannot shadow user columns,
+  ;; including columns of file/SQL sources whose names are unknown.
+  (select-query table
+                [[:__input__ :__garun_row__]
+                 [[:% [:hash (seeded-key opts) (literal (get opts :seed 0))]
+                   (literal 1000000000)] :__garun_bucket__]]))
 
 (defn- split-range [bucketed columns [lower upper]]
-  (plan (fragment (select-sql bucketed (fragment "__garun_row__.*"))
-                  " WHERE __garun_bucket__ >= " (literal (long (* 1000000000 lower)))
-                  " AND __garun_bucket__ < " (literal (long (* 1000000000 upper)))) columns))
+  (plan {:select [:__garun_row__.*]
+         :from [[bucketed :__input__]]
+         :where [:and [:>= :__garun_bucket__ (literal (long (* 1000000000 lower)))]
+                 [:< :__garun_bucket__ (literal (long (* 1000000000 upper)))]]} columns))
 
 (defn- split-plan [table opts]
   (split-options! opts)
@@ -438,7 +420,7 @@
         output (distinct-names! (mapv column-name items))]
     (when (empty? items)
       (invalid! [op] "Select requires columns" items))
-    (plan (select-sql table (combine-sql "" ", " "" (map #(expression [:col %]) items))) output)))
+    (plan (select-query table (mapv #(vector (identifier %)) items)) output)))
 
 (defmethod clause :rename [table [op & args]]
   (arity! op args 1)
@@ -449,17 +431,16 @@
         output (when (names table)
                  (distinct-names! (mapv #(get renames (str/lower-case %) %) (names table))))
         projection (if (seq entries)
-                     (combine-sql "* RENAME (" ", " ")"
-                                  (map (fn [[old new]] (fragment (quote-name old) " AS " (quote-name new))) entries))
-                     (fragment "*"))]
-    (plan (select-sql table projection) output)))
+                     [[:* {:rename (mapv (fn [[old new]] [(identifier old) [(identifier new)]]) entries)}]]
+                     [:*])]
+    (plan (select-query table projection) output)))
 
 (defmethod clause :where [table [op & args]]
   (arity! op args 1)
-  (plan (fragment (select-sql table (fragment "*")) " WHERE " (expression (first args))) (names table)))
+  (plan (assoc (select-query table [:*]) :where (expression (first args))) (names table)))
 
 (defn- struct-field [[column expr]]
-  (fragment (quote-name column) " := " (expression expr)))
+  [:garun/struct-field (identifier column) (expression expr)])
 
 (defn- derived-plan [table op args]
   (arity! op args 1)
@@ -471,18 +452,15 @@
         input-names (names table)
         retained (when input-names (filterv #(not (contains? replaced (str/lower-case %))) input-names))
         projection (cond
-                     (empty? entries) (fragment "*")
+                     (empty? entries) [:*]
                      input-names
-                     (combine-sql "" ", " ""
-                                  (concat (map #(fragment (quote-name %)) retained)
-                                          (map aliased-expression entries)))
-                     ;; SELECT *, value AS x duplicates existing x; * REPLACE
-                     ;; cannot add a new x. Updating the row struct handles both
-                     ;; cases without inspecting an unknown file/SQL schema.
+                     (into (mapv #(vector (identifier %)) retained)
+                           (map aliased-expression entries))
+                     ;; Updating the row struct replaces and adds fields without
+                     ;; inspecting an unknown file/SQL schema.
                      :else
-                     (fragment "unnest(struct_update(__input__, "
-                               (combine-sql "" ", " "" (map struct-field entries)) "))"))]
-    (plan (select-sql table projection) (when input-names (into retained aliases)))))
+                     [[[:unnest (into [:struct_update :__input__] (map struct-field entries))]]])]
+    (plan (select-query table projection) (when input-names (into retained aliases)))))
 
 (defmethod clause :derive [table [op & args]]
   (derived-plan table op args))
@@ -497,25 +475,23 @@
       (invalid! [op] "Group-by requires key vector and aggregate map" args))
     (let [entries (sort-by #(column-name (first %)) aggregates)
           output (distinct-names! (into (mapv column-name keys) (map #(column-name (first %)) entries)))
-          projection (concat (map #(expression [:col %]) keys) (map aliased-expression entries))]
+          projection (into (mapv #(vector (identifier %)) keys) (map aliased-expression entries))]
       (when (empty? projection)
         (invalid! [op] "Group-by requires keys or aggregates" args))
-      (plan (fragment (select-sql table (combine-sql "" ", " "" projection))
-                      (if (seq keys)
-                        (combine-sql " GROUP BY " ", " "" (map #(expression [:col %]) keys)) "")) output))))
+      (plan (cond-> (select-query table projection)
+              (seq keys) (assoc :group-by (mapv identifier keys))) output))))
 
 (defmethod clause :order-by [table [op & args]]
   (let [items (clause-items op args)]
     (when (empty? items)
       (invalid! [op] "Order-by requires columns" items))
-    (plan (fragment (select-sql table (fragment "*"))
-                    (combine-sql " ORDER BY " ", " "" (map order-item items))) (names table))))
+    (plan (assoc (select-query table [:*]) :order-by (mapv order-item items)) (names table))))
 
 (defmethod clause :limit [table [op & args]]
   (arity! op args 1)
   (when-not (and (integer? (first args)) (not (neg? (first args))))
     (invalid! [op] "Limit must be nonnegative" args))
-  (plan (fragment (select-sql table (fragment "*")) " LIMIT " (literal (first args))) (names table)))
+  (plan (assoc (select-query table [:*]) :limit (literal (first args))) (names table)))
 
 (defmethod clause :sample [table [op & args]]
   (arity! op args 1)
@@ -527,9 +503,9 @@
         (invalid! [op :n] "Sample size must be positive" n))
       (when-not (integer? seed)
         (invalid! [op :seed] "Seed must be integer" seed))
-      (plan (fragment (select-sql table (fragment "*"))
-                      " ORDER BY hash(" (seeded-key opts) ", " (literal seed) ") LIMIT " (literal n))
-            (names table)))))
+      (plan (assoc (select-query table [:*])
+                   :order-by [[[:hash (seeded-key opts) (literal seed)]]]
+                   :limit (literal n)) (names table)))))
 
 (defmethod clause :join [table [op & args]]
   (arity! op args 2)
@@ -539,12 +515,28 @@
   (arity! op args 1)
   (split-plan table (first args)))
 
+(defmethod clause :honeysql [table [op & args]]
+  (arity! op args 1)
+  (let [transformation (first args)]
+    (options! op transformation
+              [:select :select-distinct :select-distinct-on :select-top :select-distinct-top
+               :where :group-by :having :window :qualify :order-by :limit :offset :fetch
+               :join :left-join :right-join :full-join :cross-join :join-by :with :with-recursive])
+    (let [projection? (some #(contains? transformation %)
+                            [:select :select-distinct :select-distinct-on :select-top :select-distinct-top])
+          base (cond-> (select-query table [:*]) projection? (dissoc :select))]
+      (plan (merge base transformation) nil))))
+
 (defmethod clause :default [_ [op]]
   (throw (ex-info "Unknown table clause" {:error :table/unknown-clause :clause op})))
 
 (defn query
   "Apply clause vectors to a table without I/O; a final :split returns tables.
   Invalid clauses throw ExceptionInfo before execution.
+
+  [:honeysql clause-map] applies native HoneySQL clauses to the previous table.
+  FROM is supplied by Garun; SELECT defaults to *. HoneySQL expressions retain
+  their own identifier/NULL conventions and :raw forms are trusted SQL.
 
   Joins suffix every colliding right column when both plans have known names
   (in-memory sources, select/group-by and their descendants). For unknown file
@@ -566,8 +558,7 @@
   "Return a table as [SQL & bound-parameters], in SQL placeholder order.
   Source descriptions are accepted too; invalid descriptions throw ExceptionInfo."
   [table]
-  (let [{:keys [sql params]} (from table)]
-    (into [sql] params)))
+  (sql/format (:query (from table)) {:quoted true}))
 
 (defn open
   "Open a DuckDB JDBC connection, in memory or at path. Close with with-open.
@@ -651,19 +642,18 @@
 (defn- copy! [^Connection db table path format]
   (when (or (not (string? path)) (empty? path) (str/includes? path "\u0000"))
     (invalid! [:copy :path] "Output path must be nonempty text without NUL" path))
-  (let [{:keys [sql params]} (from table)
-        table-name (str "__garun_copy_" (str/replace (str (UUID/randomUUID)) "-" ""))
-        create-sql (str "CREATE TEMP TABLE " table-name " AS " sql)
-        copy-sql (str "COPY " table-name " TO '" (str/replace path "'" "''")
-                      "' (FORMAT " format (when (= "CSV" format) ", HEADER TRUE") ")")]
-    (with-open [statement (prepare! db (into [create-sql] params))]
+  (let [table (from table)
+        table-name (keyword (str "__garun_copy_" (str/replace (str (UUID/randomUUID)) "-" "")))
+        materialized (assoc-in table [:query :create-table-as] [:temp table-name])]
+    (with-open [statement (prepare! db (->sql materialized))]
       (.execute statement))
     (try
-      (with-open [statement (prepare! db [copy-sql])]
+      (with-open [statement (prepare! db (sql/format {:garun/copy [table-name path format]}
+                                                     {:quoted true}))]
         (.execute statement))
       nil
       (finally
-        (with-open [statement (prepare! db [(str "DROP TABLE " table-name)])]
+        (with-open [statement (prepare! db (sql/format {:drop-table [table-name]} {:quoted true}))]
           (.execute statement))))))
 
 (defn write-csv!
@@ -683,7 +673,7 @@
     (cond
       (nil? value) (throw (ex-info "NULL matrix value" {:error :table/null-value :column column}))
       (not (number? value)) (throw (ex-info "Nonnumeric matrix value"
-                                          {:error :table/non-numeric :column column :value value}))
+                                            {:error :table/non-numeric :column column :value value}))
       :else (float value))))
 
 (defn- matrix-row! [result indexed-columns]
