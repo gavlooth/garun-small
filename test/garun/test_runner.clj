@@ -1,9 +1,15 @@
 (ns garun.test-runner
-  "Run the table, neural-network and metric suites; failures set the process exit code."
+  "Run every Garun suite; failures set the process exit code."
   (:require [clojure.test :as test]
             [garun.table-test]
             [garun.nn-test]
-            [garun.metrics-test]))
+            [garun.metrics-test]
+            [garun.blocks-test]
+            [garun.tensor-test]
+            [garun.training-test]
+            [garun.model-test]
+            [garun.losses-test]
+            [garun.optimizers-test]))
 
 (set! *warn-on-reflection* true)
 
@@ -12,6 +18,12 @@
   [& _]
   (let [{:keys [fail error]} (test/run-tests 'garun.table-test
                                              'garun.nn-test
-                                             'garun.metrics-test)
+                                             'garun.metrics-test
+                                             'garun.blocks-test
+                                             'garun.tensor-test
+                                             'garun.training-test
+                                             'garun.model-test
+                                             'garun.losses-test
+                                             'garun.optimizers-test)
         failed? (pos? (+ fail error))]
     (System/exit (if failed? 1 0))))

@@ -1,10 +1,20 @@
 (ns garun.nn-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
+            [garun.blocks :as blocks]
             [garun.nn :as nn]
-            [garun.table :as table])
-  (:import [ai.djl Model]
+            [garun.table :as table]
+            [garun.tensor :as tensor]
+            [garun.training :as training])
+  (:import [ai.djl Device Model]
            [ai.djl.nn Block]
-           [ai.djl.ndarray.types Shape]
+           [ai.djl.ndarray NDArray NDList NDManager]
+           [ai.djl.ndarray.types DataType Shape]
+           [ai.djl.training DefaultTrainingConfig TrainingResult]
+           [ai.djl.training.dataset ArrayDataset$Builder]
+           [ai.djl.translate NoopTranslator Translator TranslatorContext]
+           [garun.nn Network]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -93,7 +103,7 @@
   (let [dir (.toFile (Files/createTempDirectory "garun-nn-test-" (make-array FileAttribute 0)))]
     (try
       (nn/save! net dir)
-      (with-open [restored (nn/load dir)]
+      (with-open [^Network restored (nn/load dir)]
         {:spec (:spec restored)
          :predictions (nn/predict restored db source {:x features})})
       (finally
@@ -192,11 +202,6 @@
              (nn/predict net db source {:x [:a :b] :output :probability}))))))
 
 (deftest block-argument-validation-is-consistent
-  (testing "option-free blocks reject arguments instead of silently ignoring them"
-    (doseq [tag [:relu :tanh :sigmoid :gelu :identity :flatten :batchnorm :layernorm]]
-      (is (= :nn/invalid-spec
-             (error-key #(nn/build [tag {}] {:input-shape [1]})))
-          (str tag " rejects options"))))
   (testing "parameterized blocks report missing or surplus arguments"
     (doseq [[spec error] [[[:activation] :nn/invalid-spec]
                           [[:activation :relu :tanh] :nn/invalid-spec]
@@ -228,3 +233,195 @@
       (is (= :nn/invalid-output (error-key #(nn/predict net db source {:x [:x] :output :unknown}))))
       (is (= :nn/unknown-option (error-key #(nn/train! net db source {:x [:x] :y :y :optim [:adam {:lr 0.01 :oops 1}]}))))
       (is (= :nn/invalid-features (error-key #(nn/predict net db source {:x [:x :y]})))))))
+
+(deftest native-dataset-training-improves-real-predictions
+  (with-open [^NDManager manager (tensor/manager {})
+              net (nn/build [:linear 1] {:input-shapes [[1 1]] :seed 41})]
+    (let [x (mapv #(/ % 20.0) (range -20 21))
+          truth (mapv #(+ 1 (* 2 %)) x)
+          ^NDArray features (tensor/array manager x {:shape [41 1] :dtype :float32})
+          ^NDArray labels (tensor/array manager truth {:shape [41 1] :dtype :float32})
+          ^ArrayDataset$Builder builder (doto (ArrayDataset$Builder.)
+                                          (.setData (into-array NDArray [features]))
+                                          (.optLabels (into-array NDArray [labels]))
+                                          (.setSampling (int 16) false))
+          dataset (.build builder)
+          before (with-open [^NDList output (nn/predict net features {:manager manager})]
+                   (vec (.toFloatArray (.singletonOrThrow output))))
+          ^TrainingResult result (nn/train! net dataset
+                                            {:epochs 100 :validation dataset
+                                             :config (training/config
+                                                      {:device :cpu :optim [:adam {:lr 0.05}]})})
+          after (with-open [^NDList output (nn/predict net features {:manager manager})]
+                  (vec (.toFloatArray (.singletonOrThrow output))))]
+      (is (< (mse after truth) (* 0.05 (mse before truth))))
+      (is (< (mse after truth) 0.05))
+      (is (= 100 (.getEpoch result)))
+      (is (some? (.getTrainLoss result)))
+      (is (< (.getValidateLoss result) 0.05))
+      (is (= (mapv float x) (vec (.toFloatArray features))))
+      (is (= 41 (.size labels)))
+      ;; Reusing the same caller dataset exercises its lifetime after Trainer.close.
+      (is (= :nn/device-mismatch
+             (error-key #(nn/train! net dataset
+                                    {:config (-> (DefaultTrainingConfig. (training/loss :mse))
+                                                 (.optDevices (into-array Device
+                                                                          [(Device/gpu Integer/MAX_VALUE)])))}))))
+      (is (= :nn/invalid-training-options
+             (error-key #(nn/train! net dataset {:config :invalid}))))
+      (is (= :nn/invalid-manager (error-key #(nn/predict net features {}))))
+      (is (= :nn/unknown-option
+             (error-key #(nn/train! net dataset {:epochs 1 :batch 16}))))
+      (is (instance? TrainingResult (nn/train! net dataset {:epochs 1}))))))
+
+(deftest multidimensional-native-predictions-outlive-network-and-preserve-inputs
+  (with-open [^NDManager manager (tensor/manager {})]
+    (let [^NDArray input (tensor/array manager (range 12)
+                                       {:shape [2 2 3] :dtype :float64})
+          ^NDList output (with-open [net (nn/build [:identity]
+                                                   {:input-shape [2 3] :dtype :float64})]
+                           (is (= [[1 2 3]] (:input-shapes net)))
+                           (nn/predict net (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+                                       {:manager manager}))]
+      (with-open [output output]
+        (let [^NDArray result (.singletonOrThrow output)]
+          (is (= [2 2 3] (vec (.getShape (.getShape result)))))
+          (is (= DataType/FLOAT64 (.getDataType result)))
+          (is (= manager (.getManager result)))
+          (.addi result (Double/valueOf (double 100)))
+          (is (= (mapv double (range 12)) (vec (.toDoubleArray input))))
+          (is (= (mapv double (range 100 112)) (vec (.toDoubleArray result))))))
+      (is (= (mapv double (range 12)) (vec (.toDoubleArray input)))))))
+
+(deftest multiple-native-inputs-and-outputs
+  (let [spec [:lambda (fn [^NDList inputs]
+                        (let [^NDArray left (.get inputs (int 0))
+                              ^NDArray right (.get inputs (int 1))]
+                          (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [(.add left right) (.sub left right)]))))]]
+    (with-open [^NDManager manager (tensor/manager {})
+                net (nn/build spec {:input-shapes [[1 2] [1 2]]})]
+      (let [^NDArray left (tensor/array manager [[1 2] [3 4]] {:dtype :float32})
+            ^NDArray right (tensor/array manager [[10 20] [30 40]] {:dtype :float32})]
+        (with-open [^NDList output (nn/predict net [left right] {:manager manager})]
+          (is (= 2 (.size output)))
+          (is (= [11.0 22.0 33.0 44.0] (vec (.toFloatArray ^NDArray (.get output (int 0))))))
+          (is (= [-9.0 -18.0 -27.0 -36.0] (vec (.toFloatArray ^NDArray (.get output (int 1)))))))
+        (is (= [1.0 2.0 3.0 4.0] (vec (.toFloatArray left))))
+        (is (= [10.0 20.0 30.0 40.0] (vec (.toFloatArray right))))))))
+
+(deftest translator-pipelines-and-native-tensor-output-lifetimes
+  (let [translator (reify Translator
+                     (getBatchifier [_] nil)
+                     (processInput [_ context input]
+                       (tensor/ndlist (.getNDManager ^TranslatorContext context)
+                                      {:data input :shape [1 2] :dtype :float32}))
+                     (processOutput [_ _ output]
+                       (reduce + (.toFloatArray (.singletonOrThrow ^NDList output)))))]
+    (with-open [net (nn/build [:identity] {:input-shape [2]})]
+      (is (= 7.0 (nn/predict-with net translator [3 4])))))
+  (with-open [^NDManager manager (tensor/manager {})]
+    (let [^NDArray input (tensor/array manager [[3 4]] {:dtype :float32})
+          ^NDList result (with-open [net (nn/build [:identity] {:input-shape [2]})]
+                           (nn/predict-with net (NoopTranslator. nil)
+                                            (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))))]
+      (with-open [result result]
+        (is (= [3.0 4.0] (vec (.toFloatArray (.singletonOrThrow result))))))
+      (is (= [3.0 4.0] (vec (.toFloatArray input)))))))
+
+(defn- with-temporary-directory! [operation]
+  (let [dir (.toFile (Files/createTempDirectory "garun-native-test-"
+                                                (make-array FileAttribute 0)))]
+    (try
+      (operation dir)
+      (finally
+        (doseq [^java.io.File file (reverse (file-seq dir))]
+          (.delete file))))))
+
+(deftest custom-reconstruction-is-explicit-and-round-trips-parameters
+  (let [spec [:factory #(blocks/compile-block [:linear 1])]]
+    (with-temporary-directory!
+      (fn [dir]
+        (with-open [db (table/open)
+                    ^NDManager manager (tensor/manager {})
+                    net (nn/build spec {:input-shape [1]})]
+          (is (= :nn/nonserializable-spec (error-key #(nn/save! net dir))))
+          (is (empty? (.listFiles ^java.io.File dir)))
+          (nn/train! net db (regression-table)
+                     {:x [:x] :y :y :epochs 100 :optim [:adam {:lr 0.05}]})
+          (let [input {:data [[0.0] [1.0]] :dtype :float32}
+                before (with-open [^NDList output (nn/predict net input {:manager manager})]
+                         (vec (.toFloatArray (.singletonOrThrow output))))]
+            (nn/save! net dir {:spec spec})
+            (is (= :nn/missing-reconstruction-spec (error-key #(nn/load dir))))
+            (with-open [^Network restored (nn/load dir {:spec spec :device :cpu})
+                        ^NDList output (nn/predict restored input {:manager manager})]
+              (is (= before (vec (.toFloatArray (.singletonOrThrow output))))))
+            (nn/save! net dir {:spec [:linear 1]})
+            (with-open [^Network restored (nn/load dir)
+                        ^NDList output (nn/predict restored input {:manager manager})]
+              (is (= [:linear 1] (:spec restored)))
+              (is (= before (vec (.toFloatArray (.singletonOrThrow output))))))))))))
+
+(deftest dtype-device-validation-and-saved-overrides
+  (is (= :tensor/invalid-dtype
+         (error-key #(nn/build [:identity] {:input-shape [1] :dtype :decimal128}))))
+  (is (= :tensor/unsupported-dtype
+         (error-key #(nn/build [:linear 1] {:input-shape [1] :dtype :bfloat16}))))
+  (is (= :tensor/unavailable-device
+         (error-key #(nn/build [:identity] {:input-shape [1] :device [:gpu Integer/MAX_VALUE]}))))
+  (is (= :nn/invalid-input-shape
+         (error-key #(nn/build [:identity] {:input-shape [1] :input-shapes [[1 1]]}))))
+  (with-open [db (table/open)
+              net (nn/build [:identity] {:input-shape [2 3]})]
+    (is (= :nn/non-tabular-input
+           (error-key #(nn/predict net db (regression-table) {:x [:x]}))))
+    (is (= :nn/non-tabular-input
+           (error-key #(nn/train! net db (regression-table) {:x [:x] :y :y})))))
+  (with-open [db (table/open)
+              net (nn/build [:identity] {:input-shape [1] :dtype :float64})]
+    (is (= :nn/non-tabular-dtype
+           (error-key #(nn/predict net db (regression-table) {:x [:x]})))))
+  (with-temporary-directory!
+    (fn [dir]
+      (with-open [net (nn/build [:linear 1] {:input-shape [1] :dtype :float64
+                                             :engine "PyTorch"})]
+        (nn/save! net dir))
+      ;; Simulate a portable saved GPU preference without requiring CUDA hardware.
+      (let [file (io/file dir "spec.edn")
+            metadata (edn/read-string (slurp file))]
+        (spit file (pr-str (assoc metadata :device [:gpu Integer/MAX_VALUE]))))
+      (is (= :tensor/unavailable-device (error-key #(nn/load dir))))
+      (with-open [^NDManager manager (tensor/manager {})
+                  ^Network restored (nn/load dir {:device (Device/cpu)})
+                  ^NDList output (nn/predict restored {:data [[1.0]] :dtype :float64}
+                                             {:manager manager})]
+        (is (= DataType/FLOAT64 (:dtype restored)))
+        (is (= (Device/cpu) (.getDevice (.getNDManager ^Model (:model restored)))))
+        (is (= DataType/FLOAT64 (.getDataType (.singletonOrThrow output)))))
+      (with-open [^NDManager manager (tensor/manager {})
+                  ^Network restored (nn/load dir {:device :cpu :dtype :float32})
+                  ^NDList output (nn/predict restored {:data [[1.0]] :dtype :float32}
+                                             {:manager manager})]
+        (is (= DataType/FLOAT32 (.getDataType (.singletonOrThrow output))))))))
+
+(deftest native-integer-identity-preserves-exact-values
+  (with-open [^NDManager manager (tensor/manager {})
+              net (nn/build [:identity] {:input-shapes [(Shape. (long-array [1 2]))]
+                                         :dtype DataType/INT64})]
+    (let [values [9007199254740993 9007199254740995]
+          ^NDArray input (tensor/array manager values {:shape [1 2] :dtype :int64})]
+      (with-open [^NDList output (nn/predict net input {:manager manager})]
+        (is (= DataType/INT64 (.getDataType (.singletonOrThrow output))))
+        (is (= values (vec (.toLongArray (.singletonOrThrow output))))))
+      (is (= values (vec (.toLongArray input)))))))
+
+(deftest native-scalar-and-empty-tensor-shapes
+  (with-open [manager (tensor/manager {:device :cpu})
+              scalar (nn/build [:identity] {:input-shapes [[]]})
+              empty (nn/build [:identity] {:input-shapes [[0 2]]})]
+    (with-open [^NDList output (nn/predict scalar {:data 7.5 :dtype :float32} {:manager manager})]
+      (is (= [] (vec (.getShape (.getShape (.singletonOrThrow output))))))
+      (is (= [7.5] (vec (.toFloatArray (.singletonOrThrow output))))))
+    (with-open [^NDList output (nn/predict empty {:data [] :shape [0 2] :dtype :float32} {:manager manager})]
+      (is (= [0 2] (vec (.getShape (.getShape (.singletonOrThrow output))))))
+      (is (= [] (vec (.toFloatArray (.singletonOrThrow output))))))))

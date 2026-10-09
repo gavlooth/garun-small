@@ -10,4 +10,9 @@
  {:test {:extra-paths ["test"]
          :main-opts ["-m" "garun.test-runner"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.7"}}
-          :ns-default build}}}
+          :ns-default build}
+  ;; Exclude the bundled CPU native jar; DJL downloads/caches the CUDA runtime.
+  :cuda {:classpath-overrides {ai.djl.pytorch/pytorch-native-cpu$linux-x86_64 ""}
+         :jvm-opts ["-DPYTORCH_VERSION=2.7.1" "-DPYTORCH_FLAVOR=cu128"]}
+  :zoo {:extra-deps {ai.djl/model-zoo {:mvn/version "0.36.0"}
+                     ai.djl.pytorch/pytorch-model-zoo {:mvn/version "0.36.0"}}}}}

@@ -1,31 +1,29 @@
 (ns garun.nn
-  "CPU neural networks expressed as Garun Hiccup and backed by DJL PyTorch.
-  Use build → train! → predict or save!; load restores a saved network.
-  A Network owns native resources: close it with with-open."
+  "DJL networks with Hiccup blocks, native datasets and translators, and DuckDB tables.
+  A Network owns its Model; close it with with-open. Native Model APIs remain available
+  through :model. Caller datasets, managers and input tensors remain caller-owned."
   (:refer-clojure :exclude [load])
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [garun.table :as table])
+            [garun.blocks :as blocks]
+            [garun.tensor :as tensor]
+            [garun.training :as training])
   (:import [ai.djl Device Model]
            [ai.djl.engine Engine]
            [ai.djl.inference Predictor]
-           [ai.djl.ndarray NDArray NDArrays NDList NDManager]
+           [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.types DataType Shape]
-           [ai.djl.nn Activation Block Blocks Parameter$Type SequentialBlock]
-           [ai.djl.nn.core Linear]
-           [ai.djl.nn.norm BatchNorm Dropout LayerNorm]
-           [ai.djl.training DefaultTrainingConfig GradientCollector Trainer]
-           [ai.djl.training.initializer XavierInitializer]
+           [ai.djl.nn Block Parameter Parameter$Type]
+           [ai.djl.training EasyTrain GradientCollector Trainer TrainingConfig]
+           [ai.djl.training.dataset Dataset]
+           [ai.djl.training.initializer Initializer XavierInitializer]
            [ai.djl.training.loss Loss]
-           [ai.djl.training.optimizer AdamW$Builder Optimizer]
-           [ai.djl.training.tracker Tracker]
-           [ai.djl.translate NoopTranslator]
-           [garun.djl FnBlock]
-           [java.util List Random]))
+           [ai.djl.translate Translator TranslatorContext]
+           [java.util Random]))
 
 (set! *warn-on-reflection* true)
 
-(defrecord Network [spec ^Model model input-shape]
+(defrecord Network [spec ^Model model input-shape input-shapes dtype device engine]
   java.lang.AutoCloseable
   (close [_] (.close model)))
 
@@ -42,151 +40,67 @@
 (defn- positive-int? [x]
   (and (integer? x) (pos? x) (<= x Integer/MAX_VALUE)))
 
-(defn- finite-number? [x]
-  (and (number? x) (Double/isFinite (double x))))
-
-(defn- activation [tag]
-  (case tag
-    :relu (Activation/reluBlock)
-    :tanh (Activation/tanhBlock)
-    :sigmoid (Activation/sigmoidBlock)
-    :gelu (Activation/geluBlock)
-    :identity (Blocks/identityBlock)
-    (invalid :nn/invalid-activation "Unknown activation" {:activation tag})))
-
-(declare compile-block!)
-
-(defn- sequential! [children]
-  (.addAll (SequentialBlock.) ^java.util.Collection (mapv compile-block! children)))
-
-(defn- combine [mode]
-  (fn [^List outputs ^NDList _input]
-    (let [arrays (mapv (fn [^NDList output] (.singletonOrThrow output)) outputs)
-          result (case mode
-                   :concat (NDArrays/concat (NDList. ^java.util.Collection arrays) (int -1))
-                   :add (reduce (fn [^NDArray a ^NDArray b] (.add a b)) arrays))]
-      (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [result])))))
-
-(defn- compile-linear! [args spec]
-  (let [arg (first args)
-        opts (if (map? arg) (options arg #{:units :bias?} :linear) {:units arg})
-        {:keys [units bias?] :or {bias? true}} opts]
-    (when-not (and (= 1 (count args)) (positive-int? units) (boolean? bias?))
-      (invalid :nn/invalid-linear "Linear requires positive integer units and boolean bias?" {:spec spec}))
-    (-> (Linear/builder) (.setUnits (long units)) (.optBias (boolean bias?)) .build)))
-
-(defn- compile-activation! [args spec]
-  (when-not (= 1 (count args))
-    (invalid :nn/invalid-spec "Activation requires one name" {:spec spec}))
-  (activation (first args)))
-
-(defn- compile-dropout! [args spec]
-  (let [{:keys [p] :or {p 0.5}} (options (first args) #{:p} :dropout)]
-    (when-not (and (= 1 (count args)) (finite-number? p) (<= 0 p) (< p 1))
-      (invalid :nn/invalid-dropout "Dropout p must be in [0, 1)" {:spec spec}))
-    (-> (Dropout/builder) (.optRate (float p)) .build)))
-
-(defn- combination-options [args spec]
-  (let [opts (options (first args) #{:combine} (first spec))
-        mode (:combine opts)
-        children (rest args)]
-    (when-not (and (#{:concat :add} mode) (seq children))
-      (invalid :nn/invalid-combination "Combination requires :add or :concat and children" {:spec spec}))
-    {:mode mode :children children}))
-
-(defn- compile-parallel! [args spec]
-  (let [{:keys [mode children]} (combination-options args spec)]
-    (FnBlock. "parallel" ^List (mapv compile-block! children) (combine mode))))
-
-(defn- compile-skip! [args spec]
-  (let [{:keys [mode children]} (combination-options args spec)]
-    (FnBlock. "skip" ^List [(sequential! children) (Blocks/identityBlock)] (combine mode))))
-
-(def ^:private block-compilers
-  {:sequential {:compile (fn [children _spec] (sequential! children))}
-   :linear     {:compile compile-linear!}
-   :activation {:compile compile-activation!}
-   :dropout    {:compile compile-dropout!}
-   :parallel   {:compile compile-parallel!}
-   :skip       {:compile compile-skip!}
-   :relu       {:no-args? true :compile (fn [_args _spec] (Activation/reluBlock))}
-   :tanh       {:no-args? true :compile (fn [_args _spec] (Activation/tanhBlock))}
-   :sigmoid    {:no-args? true :compile (fn [_args _spec] (Activation/sigmoidBlock))}
-   :gelu       {:no-args? true :compile (fn [_args _spec] (Activation/geluBlock))}
-   :identity   {:no-args? true :compile (fn [_args _spec] (Blocks/identityBlock))}
-   :flatten    {:no-args? true :compile (fn [_args _spec] (Blocks/batchFlattenBlock))}
-   :batchnorm  {:no-args? true :compile (fn [_args _spec] (.build (BatchNorm/builder)))}
-   :layernorm  {:no-args? true :compile (fn [_args _spec]
-                                          (-> (LayerNorm/builder) (.axis (int-array [1])) .build))}})
-
-(defn- compile-block! [spec]
-  (when-not (and (vector? spec) (keyword? (first spec)))
-    (invalid :nn/invalid-spec "A network block must be a Hiccup vector" {:spec spec}))
-  (let [[tag & args] spec
-        {:keys [no-args?] compiler :compile} (get block-compilers tag)]
-    (when-not compiler
-      (invalid :nn/unknown-tag "Unknown neural network block" {:tag tag}))
-    (when (and no-args? (seq args))
-      (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec}))
-    (compiler args spec)))
-
-(defn- initialize-network! [spec input-shape seed]
-  (let [^Block block (compile-block! spec)
-        ^Engine engine (Engine/getInstance)
-        _ (.setRandomSeed engine (int seed))
-        ^Model model (Model/newInstance "garun" (Device/cpu))]
-    (try
-      (.setBlock model block)
-      (.setInitializer block (XavierInitializer.) Parameter$Type/WEIGHT)
-      (.initialize block (.getNDManager model) DataType/FLOAT32
-                   (into-array Shape [(Shape. (long-array (into [1] input-shape)))]))
-      (->Network spec model input-shape)
-      (catch Throwable error
-        (.close model)
-        (throw error)))))
+(defn- initialization-shapes [opts]
+  (let [{:keys [input-shape input-shapes]} opts
+        per-sample? (contains? opts :input-shape)
+        full? (contains? opts :input-shapes)]
+    (when (= per-sample? full?)
+      (invalid :nn/invalid-input-shape
+               "Provide exactly one of :input-shape (per sample) or :input-shapes (full DJL shapes)"
+               (select-keys opts [:input-shape :input-shapes])))
+    (when (and per-sample?
+               (not (and (vector? input-shape)
+                         (every? #(and (integer? %) (pos? %) (<= % Long/MAX_VALUE)) input-shape))))
+      (invalid :nn/invalid-input-shape "Input shape must contain positive integer dimensions"
+               {:input-shape input-shape}))
+    (when (and full? (not (and (vector? input-shapes) (seq input-shapes))))
+      (invalid :nn/invalid-input-shape "Input shapes must be a nonempty vector of full shapes"
+               {:input-shapes input-shapes}))
+    (let [shapes (if per-sample? [(into [1] input-shape)] input-shapes)]
+      (mapv (fn [dims] (vec (.getShape ^Shape (tensor/shape dims))))
+            shapes))))
 
 (defn build
-  "Build and initialize a CPU Network from Hiccup and {:input-shape [features]}.
-  Close it with with-open. Throws ExceptionInfo for invalid specs or options."
+  "Initialize a Network. :input-shape contains arbitrary per-sample dimensions
+  (batch 1 is prepended); :input-shapes contains full concrete DJL shapes,
+  including scalar and zero-sized tensors.
+  These options are mutually exclusive. :dtype defaults to :float32, :device
+  to :cpu, :engine to DJL's default, and :seed to 11. Native Blocks are accepted."
   ^Network [spec opts]
-  (let [{:keys [input-shape seed] :or {seed 11}} (options opts #{:input-shape :seed} :build)]
-    (when-not (and (vector? input-shape) (= 1 (count input-shape)) (every? positive-int? input-shape))
-      (invalid :nn/invalid-input-shape "Input shape must be [positive-feature-count]" {:input-shape input-shape}))
+  (let [{:keys [seed device dtype engine] :or {seed 11 device :cpu dtype :float32}}
+        (options opts #{:input-shape :input-shapes :seed :device :dtype :engine} :build)
+        shapes (initialization-shapes opts)
+        _ (when (and (contains? opts :engine) (not (string? engine)))
+            (invalid :nn/invalid-engine ":engine must be a DJL engine name" {:engine engine}))
+        ^Engine backend (if engine (Engine/getEngine engine) (Engine/getInstance))
+        ^DataType data-type (tensor/dtype dtype backend)
+        ^Device model-device (tensor/device device backend)
+        ^Block block (blocks/compile-block spec)]
     (when-not (integer? seed)
       (invalid :nn/invalid-seed "Seed must be an integer" {:seed seed}))
-    (initialize-network! spec input-shape seed)))
-
-(defn- optimizer! [spec]
-  (when-not (and (vector? spec) (= 2 (count spec)))
-    (invalid :nn/invalid-optimizer "Optimizer must be [name options]" {:optim spec}))
-  (let [[tag opts] spec
-        allowed (case tag :sgd #{:lr :momentum} :adam #{:lr} :adamw #{:lr :weight-decay}
-                      (invalid :nn/invalid-optimizer "Unknown optimizer" {:optim spec}))
-        {:keys [lr momentum weight-decay] :or {lr 0.01 momentum 0.0 weight-decay 0.01}}
-        (options opts allowed :optimizer)]
-    (when-not (and (finite-number? lr) (pos? lr)
-                   (finite-number? momentum) (<= 0 momentum) (< momentum 1)
-                   (finite-number? weight-decay) (<= 0 weight-decay))
-      (invalid :nn/invalid-optimizer "Invalid optimizer numeric option" {:optim spec}))
-    (case tag
-      :sgd (-> (Optimizer/sgd) (.setLearningRateTracker (Tracker/fixed (float lr)))
-               (.optMomentum (float momentum)) .build)
-      :adam (-> (Optimizer/adam) (.optLearningRateTracker (Tracker/fixed (float lr))) .build)
-      :adamw (let [^AdamW$Builder builder (-> (Optimizer/adamW)
-                                              (.optLearningRateTracker (Tracker/fixed (float lr)))
-                                              (.optWeightDecays (float weight-decay)))]
-               (.build builder)))))
-
-(defn- loss-function [loss]
-  (case loss
-    :mse (Loss/l2Loss "mse" (float 1.0))
-    :mae (Loss/l1Loss "mae" (float 1.0))
-    ;; DJL's boolean is fromSigmoid, so false means raw logits.
-    :bce (Loss/sigmoidBinaryCrossEntropyLoss "bce" (float 1.0) false)
-    :ce (Loss/softmaxCrossEntropyLoss "ce" (float 1.0) (int -1) true true)
-    (invalid :nn/invalid-loss "Unknown loss" {:loss loss})))
+    (.setRandomSeed backend (int seed))
+    (let [^Model model (Model/newInstance "garun" model-device (.getEngineName backend))]
+      (try
+        (.setBlock model block)
+        (.setDataType model data-type)
+        (.setInitializer block (XavierInitializer.) Parameter$Type/WEIGHT)
+        (.initialize block (.getNDManager model) data-type
+                     (into-array Shape (map tensor/shape shapes)))
+        (->Network spec model
+                   (when (= 1 (count shapes)) (vec (rest (first shapes))))
+                   shapes data-type model-device (.getEngineName backend))
+        (catch Throwable error
+          (.close model)
+          (throw error))))))
 
 (defn- feature-columns [net x]
+  (when-not (and (= 1 (count (:input-shapes net))) (= 1 (count (:input-shape net))))
+    (invalid :nn/non-tabular-input
+             "Table operations require one rank-2 input; use native datasets/tensors for other shapes"
+             {:input-shapes (:input-shapes net)}))
+  (when-not (= DataType/FLOAT32 (:dtype net))
+    (invalid :nn/non-tabular-dtype "Table operations require a float32 network"
+             {:dtype (:dtype net)}))
   (when-not (and (vector? x) (seq x) (every? keyword? x) (= (count x) (first (:input-shape net))))
     (invalid :nn/invalid-features "Features must match the network input shape" {:x x :input-shape (:input-shape net)}))
   x)
@@ -195,11 +109,14 @@
   (let [y-cols (if (keyword? y) [y] y)
         _ (when-not (and (vector? y-cols) (seq y-cols) (every? keyword? y-cols))
             (invalid :nn/invalid-labels "Labels must be a keyword or vector of keywords" {:y y}))
-        features (table/matrix db source x)
-        labels (table/matrix db source y-cols)
+        [features labels] (tensor/table-matrices db source [x y-cols])
         ^Model model (:model net)
         ^Block block (.getBlock model)
-        ^Shape output (first (.getOutputShapes block (into-array Shape [(Shape. (long-array [1 (count x)]))])))
+        outputs (.getOutputShapes block (into-array Shape (map tensor/shape (:input-shapes net))))
+        _ (when-not (and (= 1 (count outputs)) (= 2 (.dimension ^Shape (first outputs))))
+            (invalid :nn/non-tabular-output "Table training requires one rank-2 output"
+                     {:output-shapes (mapv #(vec (.getShape ^Shape %)) outputs)}))
+        ^Shape output (first outputs)
         width (.getLastDimension output)
         ^floats label-data (:data labels)]
     (when-not (pos? (:rows features))
@@ -273,15 +190,13 @@
 
 (defn- prepare-training! [net db source opts]
   (let [{:keys [x y loss epochs batch shuffle? seed optim validation]} (training-options net opts)
-        ^Loss loss-fn (loss-function loss)
+        ^Loss loss-fn (training/loss loss)
         dataset (dataset! net db source x y loss)
         validation-data (when validation (dataset! net db validation x y loss))
         indices (vec (range (get-in dataset [:features :rows])))
         validation-indices (when validation-data
                              (vec (range (get-in validation-data [:features :rows]))))
-        config (-> (DefaultTrainingConfig. loss-fn)
-                   (.optDevices (into-array Device [(Device/cpu)]))
-                   (.optOptimizer (optimizer! optim)))]
+        config (training/config {:loss loss-fn :optim optim :device (:device net)})]
     {:loss-fn loss-fn :config config :dataset dataset :indices indices
      :validation-data validation-data :validation-indices validation-indices
      :epochs epochs :batch batch :shuffle? shuffle? :sparse? (= loss :ce)
@@ -297,18 +212,68 @@
       (assoc :validation-loss
              (epoch-loss! trainer loss-fn validation-data validation-indices batch sparse? false)))))
 
+(def ^:private native-training-keys
+  #{:loss :optim :device :devices :listeners :evaluators :initializer :parameter-type :executor})
+
+(defn- native-training-config [net opts]
+  (when (and (contains? opts :config) (some #(contains? opts %) native-training-keys))
+    (invalid :nn/invalid-training-options
+             "A native :config cannot be combined with training configuration options"
+             {:options opts}))
+  (when (and (contains? opts :config) (not (instance? TrainingConfig (:config opts))))
+    (invalid :nn/invalid-training-options ":config must be a native TrainingConfig" {:config (:config opts)}))
+  (let [^TrainingConfig config (if (contains? opts :config)
+                                 (:config opts)
+                                 (training/config
+                                  (cond-> (select-keys opts native-training-keys)
+                                    (not (contains? opts :devices))
+                                    (assoc :device (:device net)))))
+        devices (vec (.getDevices config))]
+    (when-not (some #(= (:device net) %) devices)
+      (invalid :nn/device-mismatch
+               "Training devices must include the network device"
+               {:model-device (:device net) :training-devices devices}))
+    (when (and (contains? opts :device)
+               (not= (:device net) (tensor/device (:device opts) (:engine net))))
+      (invalid :nn/device-mismatch "Training :device must match the network device"
+               {:model-device (:device net) :device (:device opts)}))
+    config))
+
 (defn train!
-  "Train net from source's DuckDB columns selected by :x and :y in opts.
-  Return {:history [per-epoch loss maps]}, with validation loss when requested.
-  BCE/CE consume logits; each call uses a fresh optimizer.
-  Throws ExceptionInfo for invalid options, labels or empty data."
-  [net db source opts]
-  (let [{:keys [config seed epochs] :as training} (prepare-training! net db source opts)
-        ^Model model (:model net)]
-    (.setRandomSeed (Engine/getInstance) (int seed))
-    (with-open [^Trainer trainer (.newTrainer model ^DefaultTrainingConfig config)]
-      (.initialize trainer (into-array Shape [(Shape. (long-array (into [1] (:input-shape net))))]))
-      {:history (mapv #(run-epoch! trainer training %) (range 1 (inc epochs)))})))
+  "Three arguments train a native DJL Dataset using EasyTrain.fit and return
+  TrainingResult. :epochs defaults to 10, :validation is an optional Dataset,
+  :config accepts a native TrainingConfig, or pass garun.training/config options.
+  Dataset.prepare is called; datasets and their source arrays are never closed.
+  TrainingResult metrics depend on configured listeners (defaults supply them).
+
+  Four arguments train DuckDB columns selected by :x/:y and return
+  {:history [per-epoch loss maps]}, with optional validation loss.
+  Tables require one rank-2 float32 input. BCE/CE consume logits."
+  ([net dataset opts]
+   (let [{:keys [epochs validation seed] :or {epochs 10 seed 0}}
+         (options opts (into native-training-keys #{:config :epochs :validation :seed}) :train-native)
+         ^Model model (:model net)
+         ^TrainingConfig config (native-training-config net opts)]
+     (when-not (and (instance? Dataset dataset)
+                    (or (nil? validation) (instance? Dataset validation))
+                    (positive-int? epochs) (integer? seed))
+       (invalid :nn/invalid-training-options
+                "Native training requires Dataset(s), positive epochs and an integer seed"
+                {:dataset dataset :options opts}))
+     (.setRandomSeed (.getEngine (.getNDManager model)) (int seed))
+     (.prepare ^Dataset dataset)
+     (when validation (.prepare ^Dataset validation))
+     (with-open [^Trainer trainer (.newTrainer model config)]
+       (.initialize trainer (into-array Shape (map tensor/shape (:input-shapes net))))
+       (EasyTrain/fit trainer (int epochs) dataset validation)
+       (.getTrainingResult trainer))))
+  ([net db source opts]
+   (let [{:keys [config seed epochs] :as training} (prepare-training! net db source opts)
+         ^Model model (:model net)]
+     (.setRandomSeed (.getEngine (.getNDManager model)) (int seed))
+     (with-open [^Trainer trainer (.newTrainer model ^TrainingConfig config)]
+       (.initialize trainer (into-array Shape (map tensor/shape (:input-shapes net))))
+       {:history (mapv #(run-epoch! trainer training %) (range 1 (inc epochs)))}))))
 
 (defn- argmax [values]
   (let [maximum (reduce max values)]
@@ -339,52 +304,169 @@
       :else (softmax values))))
 
 (defn- output-rows [^NDArray array output]
+  (when-not (= 2 (.dimension (.getShape array)))
+    (invalid :nn/non-tabular-output "Table predictions require a rank-2 output"
+             {:shape (vec (.getShape (.getShape array)))}))
   (let [width (.getLastDimension (.getShape array))
         rows (partition (int width) (.toFloatArray array))]
     (mapv #(output-value (mapv double %) output) rows)))
 
 (defn predict
-  "Predict net from source's columns selected by :x in opts, in table order.
-  :raw returns logits; :class applies argmax/zero threshold; :probability
-  applies softmax/sigmoid. Single-output networks return a flat vector.
-  Throws ExceptionInfo for invalid options or feature columns."
-  [net db source opts]
-  (let [{:keys [x output] :or {output :raw}} (options opts #{:x :output} :predict)
-        _ (feature-columns net x)
-        _ (when-not (#{:raw :class :probability} output)
-            (invalid :nn/invalid-output "Unknown prediction output" {:output output}))
-        {:keys [rows cols data]} (table/matrix db source x)
+  "Three arguments perform native tensor inference. opts requires :manager, a
+  caller-owned NDManager; inputs may be an NDList, tensors or tensor descriptors.
+  Return an independent NDList owned by that manager, valid after the predictor
+  and Network close. Inputs are copied, never closed, detached or stolen.
+
+  Four arguments predict from DuckDB columns :x in table order. :raw returns
+  logits; :class applies argmax/zero threshold; :probability softmax/sigmoid.
+  Single-output tables return a flat vector; input/output must be rank 2."
+  ([net inputs opts]
+   (let [{:keys [manager]} (options opts #{:manager} :predict-native)
+         ^Model model (:model net)]
+     (when-not (instance? NDManager manager)
+       (invalid :nn/invalid-manager "Native prediction requires a caller-owned :manager"
+                {:manager manager}))
+     (with-open [^NDManager input-manager (.newSubManager (.getNDManager model))]
+       (let [input (tensor/ndlist input-manager inputs)
+             translator (reify Translator
+                          (getBatchifier [_] nil)
+                          (processInput [_ _ value] value)
+                          (processOutput [_ _ output]
+                            ;; Copy before DJL closes its per-prediction context.
+                            (tensor/ndlist manager output)))]
+         (with-open [^Predictor predictor (.newPredictor model translator ^Device (:device net))]
+           (.predict predictor input))))))
+  ([net db source opts]
+   (let [{:keys [x output] :or {output :raw}} (options opts #{:x :output} :predict)
+         _ (feature-columns net x)
+         _ (when-not (#{:raw :class :probability} output)
+             (invalid :nn/invalid-output "Unknown prediction output" {:output output}))
+         [{:keys [rows cols data]}] (tensor/table-matrices db source [x])
+         ^Model model (:model net)]
+     (if (zero? rows)
+       []
+       (with-open [^NDManager manager (.newSubManager (.getNDManager model))
+                   ^NDList result (predict net {:data data :shape [rows cols] :dtype :float32}
+                                           {:manager manager})]
+         (when-not (= 1 (.size result))
+           (invalid :nn/non-tabular-output "Table predictions require a single output tensor"
+                    {:outputs (.size result)}))
+         (output-rows (.singletonOrThrow result) output))))))
+
+(defn- independent-output! [value ^NDManager manager]
+  (cond
+    (instance? NDArray value)
+    (let [^NDArray copy (.duplicate ^NDArray value)]
+      (.attach copy manager)
+      copy)
+
+    (instance? NDList value)
+    (NDList. ^java.util.Collection (mapv #(independent-output! % manager) value))
+
+    :else value))
+
+(defn predict-with
+  "Run a native Translator pipeline, returning its typed output and closing the
+  internal Predictor. Direct NDArray/NDList outputs are independent detached
+  copies: caller MUST close them. Other outputs follow the translator's resource
+  contract; nested tensor resources must be managed by the translator itself.
+  Native translator callbacks govern their own input ownership."
+  [net translator input]
+  (when-not (instance? Translator translator)
+    (invalid :nn/invalid-translator "predict-with requires a native Translator"
+             {:translator translator}))
+  (let [^Translator native translator
+        wrapper (reify Translator
+                  (getBatchifier [_] (.getBatchifier native))
+                  (prepare [_ context] (.prepare native context))
+                  (processInput [_ context value] (.processInput native context value))
+                  (batchProcessInput [_ context values] (.batchProcessInput native context values))
+                  (processOutput [_ context output]
+                    (independent-output! (.processOutput native context output)
+                                         (.getPredictorManager ^TranslatorContext context)))
+                  (batchProcessOutput [_ context output]
+                    (mapv #(independent-output! % (.getPredictorManager ^TranslatorContext context))
+                          (.batchProcessOutput native context output))))
         ^Model model (:model net)]
-    (if (zero? rows)
-      []
-      (with-open [^NDManager manager (.newSubManager (.getNDManager model))
-                  ^Predictor predictor (.newPredictor model (NoopTranslator. nil))
-                  ^NDList result (.predict predictor
-                                           (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [(.create manager ^floats data (Shape. (long-array [rows cols])))])))]
-        (output-rows (.singletonOrThrow result) output)))))
+    (with-open [^Predictor predictor (.newPredictor model wrapper ^Device (:device net))]
+      (let [result (.predict predictor input)]
+        (cond
+          (instance? NDArray result) (.detach ^NDArray result)
+          (instance? NDList result) (.detach ^NDList result))
+        result))))
 
 (defn save!
-  "Save net's spec.edn and DJL parameters to dir, returning nil.
-  Paths are trusted caller input. Filesystem or DJL failures propagate."
-  [net dir]
-  (let [file (io/file dir)
-        ^Model model (:model net)]
-    (.mkdirs file)
-    (.save model (.toPath file) "garun")
-    (spit (io/file file "spec.edn") (pr-str (select-keys net [:spec :input-shape])))
-    nil))
+  "Save spec.edn and DJL parameters, returning nil. Plain Hiccup is persisted.
+  Native/custom blocks require explicit opts {:spec reconstruction-spec}; if
+  that spec is not plain reconstructible EDN, metadata records that load must
+  receive :spec. Missing reconstruction fails BEFORE any files are written.
+  Paths are trusted caller input; filesystem/DJL failures propagate."
+  ([net dir] (save! net dir {}))
+  ([net dir opts]
+   (options opts #{:spec} :save)
+   (let [spec (if (contains? opts :spec) (:spec opts) (:spec net))
+         serializable? (blocks/serializable-spec? spec)
+         _ (when (and (not serializable?) (not (contains? opts :spec)))
+             (invalid :nn/nonserializable-spec
+                      "Native/custom blocks require an explicit reconstruction :spec when saving"
+                      {}))
+         _ (when (nil? spec)
+             (invalid :nn/nonserializable-spec "Reconstruction :spec cannot be nil" {}))
+         ^Device device (:device net)
+         ^DataType dtype (:dtype net)
+         metadata (cond-> {:input-shapes (:input-shapes net)
+                           :dtype (.name dtype) :engine (:engine net)
+                           :device (if (.isGpu device) [:gpu (.getDeviceId device)] :cpu)}
+                    serializable? (assoc :spec spec)
+                    (not serializable?) (assoc :requires-spec? true))
+         file (io/file dir)
+         ^Model model (:model net)]
+     (.mkdirs file)
+     (.save model (.toPath file) "garun")
+     (spit (io/file file "spec.edn") (pr-str metadata))
+     nil)))
+
+(defn- cast-parameters! [^Model model ^DataType dtype]
+  ;; Block.cast is unimplemented in DJL's base blocks. Reinitialize each loaded
+  ;; parameter from its converted array using the public Initializer contract.
+  (doseq [^Parameter parameter (.values (.getParameters (.getBlock model)))
+          :let [^NDArray array (.getArray parameter)]
+          :when (not= dtype (.getDataType array))]
+    (let [converted (.toType array dtype true)
+          initializer (.getInitializer parameter)]
+      (try
+        (.setInitializer parameter
+                         (reify Initializer (initialize [_ _ _ _] converted)))
+        (.close parameter)
+        (.initialize parameter (.getNDManager model) dtype)
+        (finally (.setInitializer parameter initializer)))))
+  (.setDataType model dtype))
 
 (defn load
-  "Load a saved Network from dir; close it with with-open.
-  Throws ExceptionInfo for an invalid saved spec; read/DJL failures propagate."
-  ^Network [dir]
-  (let [file (io/file dir)
-        {:keys [spec input-shape]} (options (edn/read-string (slurp (io/file file "spec.edn"))) #{:spec :input-shape} :saved-spec)
-        net (build spec {:input-shape input-shape})
-        ^Model model (:model net)]
-    (try
-      (.load model (.toPath file) "garun")
-      net
-      (catch Throwable error
-        (.close model)
-        (throw error)))))
+  "Restore a saved Network. opts :spec overrides reconstruction (required when
+  saved metadata says :requires-spec?). :device/:dtype/:engine override metadata;
+  use :device :cpu to restore a GPU save on CPU. Saved dtype is restored unless
+  explicitly overridden. Close the returned Network with with-open."
+  ([dir] (load dir {}))
+  ([dir opts]
+   (options opts #{:spec :device :dtype :engine} :load)
+   (let [file (io/file dir)
+         metadata (options (edn/read-string (slurp (io/file file "spec.edn")))
+                           #{:spec :input-shapes :dtype :engine :device :requires-spec?} :saved-spec)
+         spec (if (contains? opts :spec) (:spec opts) (:spec metadata))
+         _ (when (nil? spec)
+             (invalid :nn/missing-reconstruction-spec
+                      "Saved custom network requires :spec on load" {}))
+         build-opts (merge (select-keys metadata [:input-shapes :engine :device])
+                           {:dtype (DataType/valueOf ^String (:dtype metadata))}
+                           (select-keys opts [:dtype :engine :device]))
+         net (build spec build-opts)
+         ^Model model (:model net)]
+     (try
+       (.load model (.toPath file) "garun")
+       (when (contains? opts :dtype)
+         (cast-parameters! model (:dtype net)))
+       net
+       (catch Throwable error
+         (.close model)
+         (throw error))))))
