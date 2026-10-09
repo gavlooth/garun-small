@@ -5,8 +5,11 @@
   Lambda functions receive/return NDList, or NDArray with :singleton? true.
   Custom combinations receive child NDLists and the original NDList. Their shape
   must be value-independent; :shape-fn can describe dtype/value-sensitive outputs
-  without allocating probe tensors. Caller functions must preserve input ownership."
+  without allocating probe tensors. Caller functions must preserve input ownership.
+  [:last-step] selects the last entry on axis 1 without retaining that dimension;
+  {:axis integer} selects another axis, including negative axes counted from the end."
   (:import [ai.djl.ndarray NDArray NDArrays NDList]
+           [ai.djl.ndarray.index NDIndex]
            [ai.djl.ndarray.types Shape SparseFormat]
            [ai.djl.nn Activation Block Blocks LambdaBlock SequentialBlock]
            [ai.djl.nn.convolutional Conv1d Conv1d$Builder Conv2d Conv2d$Builder
@@ -414,36 +417,61 @@
            (into-array Shape [next-sentence
                               (Shape. (long-array [(* (.get masked 0) (.get masked 1)) (.get masked 2)]))])))))))
 
-(defn- transform! [tag args]
-  (let [opts (one-options args (case tag :reshape #{:shape} :transpose #{:axes}
-                                     (:softmax :log-softmax :expand-dims :squeeze) #{:axis}) tag)]
+(defn- transform! [tag arguments]
+  (let [options (one-options arguments
+                             (case tag :reshape #{:shape} :transpose #{:axes}
+                                   (:softmax :log-softmax :expand-dims :squeeze :last-step) #{:axis})
+                             tag)]
     (case tag
       :reshape
-      (let [dims (:shape opts)
-            _ (when-not (and (vector? dims)
-                             (every? #(and (integer? %) (or (= -1 %) (pos? %))) dims)
-                             (<= (count (filter #{-1} dims)) 1))
-                (invalid :nn/invalid-spec "Reshape :shape requires positive dimensions and at most one -1" {:options opts}))
-            shape (Shape. (long-array dims))]
-        (LambdaBlock/singleton (sam (fn [^NDArray x] (.reshape x shape))) "reshape"))
+      (let [dimensions (:shape options)
+            _ (when-not (and (vector? dimensions)
+                             (every? #(and (integer? %) (or (= -1 %) (pos? %))) dimensions)
+                             (<= (count (filter #{-1} dimensions)) 1))
+                (invalid :nn/invalid-spec "Reshape :shape requires positive dimensions and at most one -1"
+                         {:options options}))
+            shape (Shape. (long-array dimensions))]
+        (LambdaBlock/singleton (sam (fn [^NDArray input] (.reshape input shape))) "reshape"))
       :transpose
-      (let [axes (:axes opts)
+      (let [axes (:axes options)
             _ (when-not (and (vector? axes) (every? #(and (integer? %) (<= 0 %)) axes)
                              (= (set axes) (set (range (count axes)))))
-                (invalid :nn/invalid-spec "Transpose :axes must be a dimension permutation" {:options opts}))
+                (invalid :nn/invalid-spec "Transpose :axes must be a dimension permutation"
+                         {:options options}))
             permutation (int-array axes)]
-        (LambdaBlock/singleton (sam (fn [^NDArray x] (.transpose x permutation))) "transpose"))
+        (LambdaBlock/singleton (sam (fn [^NDArray input] (.transpose input permutation))) "transpose"))
+      :last-step
+      (let [axis (get options :axis 1)
+            _ (when-not (and (integer? axis) (<= Integer/MIN_VALUE axis Integer/MAX_VALUE))
+                (invalid :nn/invalid-spec "Last-step :axis must be an int32 integer"
+                         {:tag tag :options options}))]
+        (LambdaBlock/singleton
+         (sam (fn [^NDArray input]
+                (let [^Shape shape (.getShape input)
+                      rank (.dimension shape)
+                      dimension (if (neg? axis) (+ rank axis) axis)]
+                  (when-not (< -1 dimension rank)
+                    (invalid :nn/invalid-spec "Last-step :axis is outside the input rank"
+                             {:tag tag :axis axis :shape (vec (.getShape shape))}))
+                  (when-not (pos? (.get shape (int dimension)))
+                    (invalid :nn/invalid-spec "Last-step requires a nonempty selected axis"
+                             {:tag tag :axis axis :shape (vec (.getShape shape))}))
+                  (.get input (-> (NDIndex.)
+                                  (.addAllDim (int dimension))
+                                  (.addIndices (long-array [-1])))))))
+         "last-step"))
       (:softmax :log-softmax :expand-dims :squeeze)
-      (let [axis (get opts :axis -1)
+      (let [axis (get options :axis -1)
             _ (when-not (integer? axis)
-                (invalid :nn/invalid-spec "Tensor operation :axis must be an integer" {:options opts}))
+                (invalid :nn/invalid-spec "Tensor operation :axis must be an integer"
+                         {:options options}))
             dimension (int axis)]
         (LambdaBlock/singleton
          (sam (case tag
-                :softmax (fn [^NDArray x] (.softmax x dimension))
-                :log-softmax (fn [^NDArray x] (.logSoftmax x dimension))
-                :expand-dims (fn [^NDArray x] (.expandDims x dimension))
-                :squeeze (fn [^NDArray x] (.squeeze x dimension)))) (name tag))))))
+                :softmax (fn [^NDArray input] (.softmax input dimension))
+                :log-softmax (fn [^NDArray input] (.logSoftmax input dimension))
+                :expand-dims (fn [^NDArray input] (.expandDims input dimension))
+                :squeeze (fn [^NDArray input] (.squeeze input dimension)))) (name tag))))))
 
 (defn- native! [tag args]
   (case tag
@@ -484,59 +512,61 @@
     :max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d
     :batchnorm :layernorm :ghost-batchnorm :embedding :word-embedding
     :rnn :lstm :gru :attention :transformer-encoder :bert :bert-pretraining
-    :reshape :transpose :softmax :log-softmax :expand-dims :squeeze :leaky-relu :elu :swish})
+    :reshape :transpose :softmax :log-softmax :expand-dims :squeeze :last-step :leaky-relu :elu :swish})
 
 (defn compile-block
   "Compile Hiccup/native Block into a real DJL Block. No model/manager is created.
   :factory is invoked on each compilation and must return a fresh Block when used
   by distinct owners. Pool/convolution spatial vectors exclude batch/channels;
-  reshape/transpose vectors describe the full tensor, including batch."
+  reshape/transpose vectors describe the full tensor, including batch. Last-step
+  defaults to axis 1, removes only the selected dimension, and borrows its input."
   ^Block [spec]
   (if (instance? Block spec)
     spec
     (do
       (when-not (and (vector? spec) (keyword? (first spec)))
         (invalid :nn/invalid-spec "A network block must be a Hiccup vector or DJL Block" {:spec spec}))
-      (let [[tag & args] spec]
-        (when (and (no-argument-tags tag) (seq args))
+      (let [[tag & arguments] spec]
+        (when (and (no-argument-tags tag) (seq arguments))
           (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec}))
         (case tag
-          :sequential (sequential! args)
-          :linear (linear! args spec)
+          :sequential (sequential! arguments)
+          :linear (linear! arguments spec)
           :activation (do
-                        (when-not (= 1 (count args))
+                        (when-not (= 1 (count arguments))
                           (invalid :nn/invalid-spec "Activation requires one name" {:spec spec}))
-                        (activation (first args)))
-          :dropout (dropout! args spec)
-          (:parallel :skip) (combination! tag args spec)
+                        (activation (first arguments)))
+          :dropout (dropout! arguments spec)
+          (:parallel :skip) (combination! tag arguments spec)
           (:relu :relu6 :tanh :sigmoid :gelu :selu :mish :softplus :softsign :prelu :identity)
           (activation tag)
           :flatten (Blocks/batchFlattenBlock)
-          (:batchnorm :layernorm) (normalization! tag (if (seq args) args [{}]))
-          :ghost-batchnorm (normalization! tag args)
-          (:conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose) (convolution! tag args)
-          (:max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d) (pooling! tag args)
+          (:batchnorm :layernorm) (normalization! tag (if (seq arguments) arguments [{}]))
+          :ghost-batchnorm (normalization! tag arguments)
+          (:conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose) (convolution! tag arguments)
+          (:max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d) (pooling! tag arguments)
           :global-max-pool1d (Pool/globalMaxPool1dBlock)
           :global-max-pool2d (Pool/globalMaxPool2dBlock)
           :global-max-pool3d (Pool/globalMaxPool3dBlock)
           :global-avg-pool1d (Pool/globalAvgPool1dBlock)
           :global-avg-pool2d (Pool/globalAvgPool2dBlock)
           :global-avg-pool3d (Pool/globalAvgPool3dBlock)
-          (:embedding :word-embedding :constant-embedding) (embedding! tag args)
-          (:rnn :lstm :gru) (recurrent! tag args)
-          (:attention :transformer-encoder) (attention! tag args)
-          (:bert :bert-pretraining) (bert! tag args)
+          (:embedding :word-embedding :constant-embedding) (embedding! tag arguments)
+          (:rnn :lstm :gru) (recurrent! tag arguments)
+          (:attention :transformer-encoder) (attention! tag arguments)
+          (:bert :bert-pretraining) (bert! tag arguments)
           :bert-next-sentence (BertNextSentenceBlock.)
-          (:reshape :transpose :softmax :log-softmax :expand-dims :squeeze) (transform! tag args)
+          :last-step (transform! tag (if (seq arguments) arguments [{}]))
+          (:reshape :transpose :softmax :log-softmax :expand-dims :squeeze) (transform! tag arguments)
           (:leaky-relu :elu :swish)
           (let [key (if (= tag :swish) :beta :alpha)
-                opts (one-options args #{key} tag)
-                value (get opts key (if (= tag :leaky-relu) 0.01 1.0))]
+                options (one-options arguments #{key} tag)
+                value (get options key (if (= tag :leaky-relu) 0.01 1.0))]
             (when-not (finite-number? value)
-              (invalid :nn/invalid-spec "Activation parameter must be finite" {:tag tag :options opts}))
+              (invalid :nn/invalid-spec "Activation parameter must be finite" {:tag tag :options options}))
             (case tag :leaky-relu (Activation/leakyReluBlock (float value))
                   :elu (Activation/eluBlock (float value)) :swish (Activation/swishBlock (float value))))
-          (:block :factory :lambda) (native! tag args)
+          (:block :factory :lambda) (native! tag arguments)
           (invalid :nn/unknown-tag "Unknown neural network block" {:tag tag}))))))
 
 (defn- plain-edn? [value]

@@ -1,10 +1,11 @@
 (ns garun.tensor
   "Safe DJL tensor construction and aligned float32 table extraction.
 
-  Managers are caller-owned: close them with with-open. Every array/ndlist
-  result belongs to the supplied manager, including independent copies of native
-  inputs. Inputs are borrowed only during construction, never attached, closed,
-  or mutated. Closing a result NDList closes its elements, not its manager.
+  Every array/ndlist result belongs to the given NDManager or context's manager,
+  including independent copies of native inputs. Close caller-owned managers
+  explicitly; session contexts own their managers. Inputs are borrowed only
+  during construction, never attached, closed, or mutated. Closing a result
+  NDList closes its elements, not its manager.
   Use native NDArray methods directly for general tensor operations."
   (:require [clojure.string :as str]
             [garun.table :as table])
@@ -12,6 +13,7 @@
            [ai.djl.engine Engine]
            [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.types DataType Shape]
+           [garun.session Context]
            [java.nio Buffer ByteBuffer DoubleBuffer FloatBuffer IntBuffer LongBuffer ShortBuffer]
            [java.nio.charset StandardCharsets]))
 
@@ -20,10 +22,10 @@
 (defn- invalid! [error message value]
   (throw (ex-info message {:error error :value value})))
 
-(defn- options! [opts allowed]
-  (when-not (map? opts)
-    (invalid! :tensor/invalid-options "Tensor options must be a map" opts))
-  (when-let [unknown (seq (remove allowed (keys opts)))]
+(defn- options! [options allowed]
+  (when-not (map? options)
+    (invalid! :tensor/invalid-options "Tensor options must be a map" options))
+  (when-let [unknown (seq (remove allowed (keys options)))]
     (invalid! :tensor/unknown-option "Unknown tensor option" (vec unknown))))
 
 (defn device
@@ -87,27 +89,14 @@
 (defn shape
   "Resolve concrete dimensions or Shape. Scalars use []; zero dimensions are
   allowed. Negative/unknown, nonintegral, and overflowing dimensions fail."
-  ^Shape [dims]
-  (let [values (if (instance? Shape dims) (vec (.getShape ^Shape dims)) dims)]
+  ^Shape [dimensions]
+  (let [values (if (instance? Shape dimensions) (vec (.getShape ^Shape dimensions)) dimensions)]
     (when-not (and (sequential? values)
                    (every? #(and (integer? %) (<= 0 % Long/MAX_VALUE)) values))
-      (invalid! :tensor/invalid-shape "Shape dimensions must be nonnegative int64 integers" dims))
+      (invalid! :tensor/invalid-shape "Shape dimensions must be nonnegative int64 integers" dimensions))
     (when (> (reduce *' 1 values) Long/MAX_VALUE)
-      (invalid! :tensor/invalid-shape "Shape cardinality exceeds int64" dims))
-    (if (instance? Shape dims) dims (Shape. (long-array values)))))
-
-(defn manager
-  "Create a caller-owned base NDManager; close it with with-open.
-  Options are :device (default :cpu) and :engine (optional DJL engine name)."
-  (^NDManager [] (manager {}))
-  (^NDManager [opts]
-   (options! opts #{:device :engine})
-   (let [engine-name (:engine opts)
-         _ (when (and (contains? opts :engine) (not (string? engine-name)))
-             (invalid! :tensor/invalid-engine "Manager :engine must be a name" engine-name))
-         ^Engine engine (if engine-name (Engine/getEngine engine-name) (Engine/getInstance))
-         resolved (device (get opts :device :cpu) engine)]
-     (.newBaseManager engine resolved))))
+      (invalid! :tensor/invalid-shape "Shape cardinality exceeds int64" dimensions))
+    (if (instance? Shape dimensions) dimensions (Shape. (long-array values)))))
 
 (defn- open-manager! [^NDManager manager]
   (when-not (and manager (.isOpen manager))
@@ -209,9 +198,65 @@
       (when-let [name (.getName data)] (.setName result name))
       result)))
 
+(defn- manager-array
+  ^NDArray [^NDManager manager data options]
+  (open-manager! manager)
+  (options! options #{:shape :dtype})
+  (when (and (instance? NDArray data) (.isReleased ^NDArray data))
+    (invalid! :tensor/closed-array "Input NDArray is closed" data))
+  (let [native? (instance? NDArray data)
+        primitive-type (primitive-dtype data)
+        description (when-not (or native? primitive-type) (layout data))
+        inferred-shape (cond native? (.getShape ^NDArray data)
+                             primitive-type [(count data)]
+                             :else (:dims description))
+        ^Shape dimensions (shape (get options :shape inferred-shape))
+        ^DataType source-type (cond native? (.getDataType ^NDArray data)
+                                    primitive-type primitive-type
+                                    :else (inferred-dtype (:types description)))
+        ^DataType target-type (if (contains? options :dtype) (dtype (:dtype options)) source-type)
+        ;; A short's numeric value is not a FLOAT16 bit pattern. Widen directly
+        ;; into supported host storage when the caller explicitly requests it.
+        ^DataType storage-type (if (and (= source-type DataType/INT16)
+                                        (contains? options :dtype) (not native?))
+                                 (if (contains? #{DataType/FLOAT32 DataType/FLOAT64 DataType/INT32
+                                                  DataType/INT64} target-type)
+                                   target-type DataType/INT32)
+                                 source-type)
+        values (if primitive-type data (:values description))
+        ^Engine engine (.getEngine manager)]
+    (when (and description (> (count (:dims description)) 1)
+               (not= (:dims description) (vec (.getShape dimensions))))
+      (invalid! :tensor/shape-mismatch "Explicit shape disagrees with nested data dimensions" (:shape options)))
+    (when-not native? (cardinality! dimensions (count values)))
+    (when (and (or (= source-type DataType/STRING) (= target-type DataType/STRING))
+               (not= source-type target-type))
+      (throw (ex-info "String tensors cannot be converted to or from numeric dtypes"
+                      {:error :tensor/unsupported-dtype :dtype target-type
+                       :source-dtype source-type :engine (.getEngineName engine)})))
+    ;; String arrays use DJL's Java-backed constructor, not native dtype JNI.
+    (when-not (= target-type DataType/STRING)
+      (dtype target-type engine)
+      (dtype storage-type engine))
+    ;; The work manager bounds intermediate copies, casts, and reshape views.
+    ;; Only the final independent result is promoted into the owner's manager.
+    (with-open [work (.newSubManager manager)]
+      (let [^NDArray created (cond
+                               native? (copy-native! work data dimensions)
+                               (= source-type DataType/STRING)
+                               (.create work ^"[Ljava.lang.String;" (into-array String values)
+                                        StandardCharsets/UTF_8 dimensions)
+                               :else (.create work (host-buffer values storage-type) dimensions storage-type))
+            ^NDArray typed (if (= target-type (.getDataType created))
+                             created (.toType created target-type false))
+            ^NDArray result (if (= dimensions (.getShape typed)) typed (.reshape typed dimensions))]
+        (.attach result manager)
+        result))))
+
 (defn array
-  "Create an independent NDArray owned by manager, on its device.
-  opts: :shape (optional concrete dimensions), :dtype (optional DJL dtype).
+  "Create an independent NDArray owned by the given manager or context's manager.
+  The result uses that manager's device. Options: :shape (optional concrete
+  dimensions), :dtype (optional DJL dtype).
   Primitive arrays preserve backend-supported dtypes; nested integers default
   to int64, floating values to float64 (Float leaves to float32), booleans to
   boolean. Unsupported inferred/requested dtypes fail before JNI. PyTorch
@@ -220,71 +265,16 @@
   Flat storage may be reshaped; explicit shapes of nested storage must match
   its rectangular layout. Native inputs retain their dtype unless overridden
   and use device-native cloning/transfer without closing caller resources."
-  (^NDArray [manager data] (array manager data {}))
-  (^NDArray [^NDManager manager data opts]
-   (open-manager! manager)
-   (options! opts #{:shape :dtype})
-   (when (and (instance? NDArray data) (.isReleased ^NDArray data))
-     (invalid! :tensor/closed-array "Input NDArray is closed" data))
-   (let [native? (instance? NDArray data)
-         primitive-type (primitive-dtype data)
-         description (when-not (or native? primitive-type) (layout data))
-         inferred-shape (cond native? (.getShape ^NDArray data)
-                              primitive-type [(count data)]
-                              :else (:dims description))
-         ^Shape dimensions (shape (get opts :shape inferred-shape))
-         ^DataType source-type (cond native? (.getDataType ^NDArray data)
-                                     primitive-type primitive-type
-                                     :else (inferred-dtype (:types description)))
-         ^DataType target-type (if (contains? opts :dtype) (dtype (:dtype opts)) source-type)
-         ;; A short's numeric value is not a FLOAT16 bit pattern. Widen directly
-         ;; into supported host storage when the caller explicitly requests it.
-         ^DataType storage-type (if (and (= source-type DataType/INT16)
-                                         (contains? opts :dtype) (not native?))
-                                  (if (contains? #{DataType/FLOAT32 DataType/FLOAT64 DataType/INT32
-                                                   DataType/INT64} target-type)
-                                    target-type DataType/INT32)
-                                  source-type)
-         values (if primitive-type data (:values description))
-         ^Engine engine (.getEngine manager)]
-     (when (and description (> (count (:dims description)) 1)
-                (not= (:dims description) (vec (.getShape dimensions))))
-       (invalid! :tensor/shape-mismatch "Explicit shape disagrees with nested data dimensions" (:shape opts)))
-     (when-not native? (cardinality! dimensions (count values)))
-     (when (and (or (= source-type DataType/STRING) (= target-type DataType/STRING))
-                (not= source-type target-type))
-       (throw (ex-info "String tensors cannot be converted to or from numeric dtypes"
-                       {:error :tensor/unsupported-dtype :dtype target-type
-                        :source-dtype source-type :engine (.getEngineName engine)})))
-     ;; String arrays use DJL's Java-backed constructor, not native dtype JNI.
-     (when-not (= target-type DataType/STRING)
-       (dtype target-type engine)
-       (dtype storage-type engine))
-     ;; The work manager bounds intermediate copies, casts, and reshape views.
-     ;; Only the final independent result is promoted into the caller manager.
-     (with-open [work (.newSubManager manager)]
-       (let [^NDArray created (cond
-                                native? (copy-native! work data dimensions)
-                                (= source-type DataType/STRING)
-                                (.create work ^"[Ljava.lang.String;" (into-array String values)
-                                         StandardCharsets/UTF_8 dimensions)
-                                :else (.create work (host-buffer values storage-type) dimensions storage-type))
-             ^NDArray typed (if (= target-type (.getDataType created))
-                              created (.toType created target-type false))
-             ^NDArray result (if (= dimensions (.getShape typed)) typed (.reshape typed dimensions))]
-         (.attach result manager)
-         result)))))
+  (^NDArray [owner data] (array owner data {}))
+  (^NDArray [owner data options]
+   (if (instance? Context owner)
+     (.call ^Context owner #(manager-array (.manager ^Context owner) data options))
+     (manager-array owner data options))))
 
 (defn- input-descriptor? [input]
   (or (instance? NDArray input) (map? input)))
 
-(defn ndlist
-  "Build an independent, manager-owned NDList from native NDList/NDArray,
-  one descriptor, a sequence of descriptors/native arrays, or plain host data.
-  Descriptor: {:data values-or-NDArray, :shape optional, :dtype optional}.
-  Plain nested numeric/boolean/string data denotes ONE tensor, not many inputs.
-  All native inputs are borrowed for this call and copied; closing the returned
-  list or manager cannot close caller inputs. Empty input sequence means no inputs."
+(defn- manager-ndlist
   ^NDList [^NDManager manager inputs]
   (open-manager! manager)
   (let [items (cond
@@ -299,26 +289,42 @@
                                (options! input #{:data :shape :dtype})
                                (when-not (contains? input :data)
                                  (invalid! :tensor/invalid-data "Tensor descriptor requires :data" input))
-                               (array work (:data input) (dissoc input :data)))
-                             (array work input {})))
+                               (manager-array work (:data input) (dissoc input :data)))
+                             (manager-array work input {})))
                          items)
             result (NDList. ^java.util.Collection arrays)]
         (.attach result manager)
         result))))
 
+(defn ndlist
+  "Build an independent NDList owned by the given manager or context's manager.
+  Inputs may be native NDList/NDArray, one descriptor, a sequence of descriptors
+  or native arrays, or plain host data.
+  Descriptor: {:data values-or-NDArray, :shape optional, :dtype optional}.
+  Plain nested numeric/boolean/string data denotes ONE tensor, not many inputs.
+  All native inputs are borrowed for this call and copied; closing the returned
+  list or owning manager cannot close caller inputs. Empty input sequence means
+  no inputs."
+  ^NDList [owner inputs]
+  (if (instance? Context owner)
+    (.call ^Context owner #(manager-ndlist (.manager ^Context owner) inputs))
+    (manager-ndlist owner inputs)))
+
 (defn table-matrices
-  "Extract float32 row-major matrices, one per nonempty keyword column vector.
+  "Extract float32 row-major matrices through context, one per keyword group.
   The unique union is selected in ONE table/matrix query and then split/reordered
   in memory, preserving feature/label alignment for nondeterministic sources.
+  Returned host matrices are independent of the context's manager lifetime.
   Table NULL/nonnumeric errors propagate unchanged. Native tensors/datasets
   are the precision-preserving path for non-float32 data."
-  [db source column-groups]
+  [^Context context source column-groups]
   (when-not (and (vector? column-groups) (seq column-groups)
                  (every? #(and (vector? %) (seq %) (every? keyword? %)) column-groups))
     (invalid! :tensor/invalid-columns "Expected nonempty groups of keyword columns" column-groups))
   (let [columns (vec (distinct (mapcat identity column-groups)))
         positions (zipmap columns (range))
-        {:keys [rows cols data] :as matrix} (table/matrix db source columns)]
+        {:keys [rows data] :as matrix} (table/matrix context source columns)
+        column-count (:cols matrix)]
     (mapv (fn [group]
             (if (= group columns)
               matrix
@@ -326,5 +332,5 @@
                 {:rows rows :cols (count group)
                  :data (float-array (for [row (range rows)
                                           column indices]
-                                      (aget ^floats data (int (+ (* row cols) column)))))})))
+                                      (aget ^floats data (int (+ (* row column-count) column)))))})))
           column-groups)))

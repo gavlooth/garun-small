@@ -1,22 +1,29 @@
 (ns garun.nn-test
-  (:require [clojure.edn :as edn]
+  (:require [clojure.datafy :as datafy]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [garun.blocks :as blocks]
             [garun.nn :as nn]
+            [garun.nn.examples :as examples]
+            [garun.session :as session]
             [garun.table :as table]
             [garun.tensor :as tensor]
             [garun.training :as training])
   (:import [ai.djl Device Model]
-           [ai.djl.nn Block]
+           [ai.djl.nn Block Parameter]
            [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.types DataType Shape]
-           [ai.djl.training DefaultTrainingConfig TrainingResult]
+           [ai.djl.training DefaultTrainingConfig Trainer]
            [ai.djl.training.dataset ArrayDataset$Builder]
+           [ai.djl.training.listener TrainingListenerAdapter]
            [ai.djl.translate NoopTranslator Translator TranslatorContext]
-           [garun.nn Network]
+           [garun.session Session]
            [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+           [java.nio.file.attribute FileAttribute]
+           [java.util.concurrent CompletableFuture ConcurrentLinkedQueue CountDownLatch TimeUnit TimeoutException]
+           [java.util.function Supplier]))
 
 (set! *warn-on-reflection* true)
 
@@ -42,47 +49,51 @@
     (table/from {:x x :y (mapv #(+ 1 (* 2 %)) x)})))
 
 (deftest linear-regression-and-validation
-  (with-open [db (table/open)
-              net (nn/build [:linear 1] {:input-shape [1] :seed 11})]
-    (let [source (regression-table)
-          before (nn/predict net db source {:x [:x]})
-          {:keys [history]} (nn/train! net db source
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1] :seed 11})
+          source (regression-table)
+          before (nn/predict current-session network source {:x [:x]})
+          {:keys [history]} (nn/train! current-session network source
                                        {:x [:x] :y :y :epochs 180 :batch 16
                                         :optim [:adam {:lr 0.05}] :validation source})
-          predictions (nn/predict net db source {:x [:x]})
-          truth (mapv :y (table/rows db source))]
+          predictions (nn/predict current-session network source {:x [:x]})
+          truth (mapv :y (table/rows current-session source))]
       (is (= 41 (count before)))
       (is (= 180 (count history)))
       (is (< (mse predictions truth) 0.05))
-      (is (< (:loss (last history)) (:loss (first history))))
+      (is (< (:training-loss (last history)) (:training-loss (first history))))
       (is (< (:validation-loss (last history)) 0.05)))))
 
 (deftest binary-classification-uses-logits-and-sigmoid-probabilities
-  (let [x (vec (concat (range -20 -1) (range 2 21)))
-        truth (mapv #(if (pos? %) 1 0) x)
-        source (table/from {:x (mapv #(/ % 10.0) x) :label truth})]
-    (with-open [db (table/open)
-                net (nn/build [:linear 1] {:input-shape [1] :seed 13})]
-      (nn/train! net db source
-                 {:x [:x] :y :label :loss :bce :epochs 90 :batch 16 :optim [:adam {:lr 0.08}]})
-      (is (>= (accuracy (nn/predict net db source {:x [:x] :output :class}) truth) 0.9))
-      (is (every? #(<= 0 % 1) (nn/predict net db source {:x [:x] :output :probability}))))))
+  (let [values (vec (concat (range -20 -1) (range 2 21)))
+        truth (mapv #(if (pos? %) 1 0) values)
+        source (table/from {:x (mapv #(/ % 10.0) values) :label truth})]
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session [:linear 1] {:input-shape [1] :seed 13})]
+        (nn/train! current-session network source
+                   {:x [:x] :y :label :loss :bce :epochs 90 :batch 16 :optim [:adam {:lr 0.08}]})
+        (is (>= (accuracy (nn/predict current-session network source {:x [:x] :output :class}) truth) 0.9))
+        (is (every? #(<= 0 % 1) (nn/predict current-session network source {:x [:x] :output :probability})))))))
 
 (deftest three-class-classification-uses-sparse-labels-and-softmax
   (let [centres [[-2.0 -2.0] [2.0 -2.0] [0.0 2.0]]
-        points (vec (for [[label [a b]] (map-indexed vector centres)
+        points (vec (for [[label [horizontal vertical]] (map-indexed vector centres)
                           offset (range -6 6)]
-                      {:a (+ a (* 0.03 offset)) :b (+ b (* 0.02 offset)) :label label}))
+                      {:a (+ horizontal (* 0.03 offset)) :b (+ vertical (* 0.02 offset)) :label label}))
         source (table/from {:a (mapv :a points) :b (mapv :b points) :label (mapv :label points)})
         truth (mapv :label points)]
-    (with-open [db (table/open)
-                net (nn/build [:linear 3] {:input-shape [2] :seed 17})]
-      (nn/train! net db source
-                 {:x [:a :b] :y :label :loss :ce :epochs 70 :batch 12 :optim [:adam {:lr 0.05}]})
-      (is (>= (accuracy (nn/predict net db source {:x [:a :b] :output :class}) truth) 0.9))
-      (is (every? #(= 3 (count %)) (nn/predict net db source {:x [:a :b]})))
-      (is (every? #(< (Math/abs (- 1.0 (reduce + %))) 1.0e-12)
-                  (nn/predict net db source {:x [:a :b] :output :probability}))))))
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session [:linear 3] {:input-shape [2] :seed 17})]
+        (nn/train! current-session network source
+                   {:x [:a :b] :y :label :loss :ce :epochs 70 :batch 12 :optim [:adam {:lr 0.05}]})
+        (is (>= (accuracy (nn/predict current-session network source {:x [:a :b] :output :class}) truth) 0.9))
+        (is (every? #(= 3 (count %)) (nn/predict current-session network source {:x [:a :b]})))
+        (let [evaluation (nn/evaluate current-session network source
+                                      {:metrics [:accuracy :precision :recall :f1 :log-loss]})]
+          (is (every? #(Double/isFinite (double %)) (vals evaluation)))
+          (is (>= (:accuracy evaluation) 0.9)))
+        (is (every? #(< (Math/abs (- 1.0 (reduce + %))) 1.0e-12)
+                    (nn/predict current-session network source {:x [:a :b] :output :probability})))))))
 
 (def ^:private composite-spec
   [:sequential
@@ -92,197 +103,228 @@
    [:parallel {:combine :concat} [:linear 2] [:linear 1]]
    [:linear 1]])
 
-(defn- network-output-shape [net input-shape]
-  (let [^Model model (:model net)
+(defn- network-output-shape [network input-shape]
+  (let [^Model model (:model network)
         ^Block block (.getBlock model)
         shapes (.getOutputShapes block (into-array Shape [(Shape. (long-array input-shape))]))
         ^Shape output-shape (first shapes)]
     (vec (.getShape output-shape))))
 
-(defn- saved-network-predictions! [net db source features]
-  (let [dir (.toFile (Files/createTempDirectory "garun-nn-test-" (make-array FileAttribute 0)))]
+(defn- saved-network-predictions! [context network source features]
+  (let [directory (.toFile (Files/createTempDirectory "garun-nn-test-" (make-array FileAttribute 0)))]
     (try
-      (nn/save! net dir)
-      (with-open [^Network restored (nn/load dir)]
+      (nn/save! context network directory)
+      (let [restored (nn/load context directory)]
         {:spec (:spec restored)
-         :predictions (nn/predict restored db source {:x features})})
+         :predictions (nn/predict context restored source {:x features})})
       (finally
-        (doseq [^java.io.File file (reverse (file-seq dir))]
+        (doseq [^java.io.File file (reverse (file-seq directory))]
           (.delete file))))))
 
 (deftest fnblock-gradients-shapes-and-child-serialization
-  (with-open [db (table/open)
-              net (nn/build composite-spec {:input-shape [2] :seed 19})]
-    (let [x (mapv #(/ % 10.0) (range -10 11))
-          source (table/from {:a x :b (mapv #(* 0.5 %) x) :y (mapv #(+ 1 (* 2 %)) x)})
-          {:keys [history]} (nn/train! net db source {:x [:a :b] :y :y :epochs 80 :batch 21 :optim [:adam {:lr 0.025}]})
-          predictions (nn/predict net db source {:x [:a :b]})]
-      (is (= [7 1] (network-output-shape net [7 2])))
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session composite-spec {:input-shape [2] :seed 19})
+          values (mapv #(/ % 10.0) (range -10 11))
+          source (table/from {:a values :b (mapv #(* 0.5 %) values) :y (mapv #(+ 1 (* 2 %)) values)})
+          {:keys [history]} (nn/train! current-session network source
+                                       {:x [:a :b] :y :y :epochs 80 :batch 21 :optim [:adam {:lr 0.025}]})
+          predictions (nn/predict current-session network source {:x [:a :b]})]
+      (is (= [7 1] (network-output-shape network [7 2])))
       (is (= 21 (count predictions)))
       (is (every? double? predictions))
-      (is (< (:loss (last history)) (:loss (first history))))
+      (is (< (:training-loss (last history)) (:training-loss (first history))))
       (is (= {:spec composite-spec :predictions predictions}
-             (saved-network-predictions! net db source [:a :b]))))))
+             (saved-network-predictions! current-session network source [:a :b]))))))
 
 (deftest direct-combination-output-shapes
-  (with-open [db (table/open)]
+  (with-open [current-session (session/open)]
     (doseq [[spec width] [[[:parallel {:combine :add} [:linear 2] [:linear 2]] 2]
                           [[:parallel {:combine :concat} [:linear 2] [:linear 3]] 5]
                           [[:skip {:combine :add} [:linear 2]] 2]
                           [[:skip {:combine :concat} [:linear 3]] 5]]]
-      (with-open [net (nn/build spec {:input-shape [2] :seed 4})]
+      (let [network (nn/build current-session spec {:input-shape [2] :seed 4})]
         (is (= [width width]
-               (mapv count (nn/predict net db (table/from {:a [1 2] :b [3 4]}) {:x [:a :b]}))))))))
+               (mapv count (nn/predict current-session network
+                                       (table/from {:a [1 2] :b [3 4]}) {:x [:a :b]}))))))))
 
 (deftest normalization-dropout-flatten-and-activations
-  (with-open [db (table/open)
-              net (nn/build [:sequential [:linear 4] [:batchnorm] [:layernorm]
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session
+                            [:sequential [:linear 4] [:batchnorm] [:layernorm]
                              [:dropout {:p 0.2}] [:flatten] [:activation :relu]
                              [:tanh] [:sigmoid] [:gelu] [:identity] [:linear 1]]
-                            {:input-shape [1] :seed 21})]
-    (let [source (regression-table)
-          {:keys [history]} (nn/train! net db source {:x [:x] :y [:y] :epochs 3 :batch 16})]
+                            {:input-shape [1] :seed 21})
+          source (regression-table)
+          {:keys [history]} (nn/train! current-session network source
+                                       {:x [:x] :y [:y] :epochs 3 :batch 16})]
       (is (= 3 (count history)))
-      (is (every? #(Double/isFinite (double (:loss %))) history))
-      (is (= 41 (count (nn/predict net db source {:x [:x]})))))))
+      (is (every? #(Double/isFinite (double (:training-loss %))) history))
+      (is (= 41 (count (nn/predict current-session network source {:x [:x]})))))))
 
 (deftest optimizer-and-mae-options
-  (with-open [db (table/open)]
-    (doseq [optim [[:sgd {:lr 0.05 :momentum 0.5}] [:adamw {:lr 0.05 :weight-decay 0.01}]]]
-      (with-open [net (nn/build [:linear {:units 1 :bias? false}] {:input-shape [1]})]
-        (let [history (:history (nn/train! net db (regression-table)
-                                           {:x [:x] :y :y :loss :mae :epochs 3 :batch 16 :shuffle? false :optim optim}))]
-          (is (= 3 (count history)))
-          (is (every? #(Double/isFinite (double (:loss %))) history)))))))
+  (with-open [current-session (session/open)]
+    (doseq [optimizer [[:sgd {:lr 0.05 :momentum 0.5}] [:adamw {:lr 0.05 :weight-decay 0.01}]]]
+      (let [network (nn/build current-session [:linear {:units 1 :bias? false}] {:input-shape [1]})
+            history (:history (nn/train! current-session network (regression-table)
+                                         {:x [:x] :y :y :loss :mae :epochs 3 :batch 16
+                                          :shuffle? false :optim optimizer}))]
+        (is (= 3 (count history)))
+        (is (every? #(Double/isFinite (double (:training-loss %))) history))))))
 
 (deftest multi-output-label-matrices
-  (with-open [db (table/open)
-              net (nn/build [:linear 2] {:input-shape [1] :seed 23})]
-    (let [x (mapv #(/ % 10.0) (range -10 11))
-          ya (mapv #(+ 1 (* 2 %)) x)
-          yb (mapv #(- (* 3 %) 1) x)
-          source (table/from {:x x :ya ya :yb yb})
-          _ (nn/train! net db source
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 2] {:input-shape [1] :seed 23})
+          values (mapv #(/ % 10.0) (range -10 11))
+          first-labels (mapv #(+ 1 (* 2 %)) values)
+          second-labels (mapv #(- (* 3 %) 1) values)
+          source (table/from {:x values :ya first-labels :yb second-labels})
+          _ (nn/train! current-session network source
                        {:x [:x] :y [:ya :yb] :epochs 140 :batch 21 :optim [:adam {:lr 0.08}]})
-          predictions (nn/predict net db source {:x [:x]})]
-      (is (< (mse (mapv first predictions) ya) 0.05))
-      (is (< (mse (mapv second predictions) yb) 0.05)))))
+          predictions (nn/predict current-session network source {:x [:x]})]
+      (is (< (mse (mapv first predictions) first-labels) 0.05))
+      (is (< (mse (mapv second predictions) second-labels) 0.05)))))
 
-(defn- train-seeded-network! [db source]
-  (with-open [net (nn/build [:sequential [:linear 3] [:tanh] [:dropout {:p 0.2}] [:linear 1]]
-                            {:input-shape [1] :seed 29})]
-    (nn/train! net db source {:x [:x] :y :y :epochs 5 :batch 13 :seed 31})))
+(defn- train-seeded-network! [context source]
+  (let [network (nn/build context [:sequential [:linear 3] [:tanh] [:dropout {:p 0.2}] [:linear 1]]
+                          {:input-shape [1] :seed 29})]
+    (nn/train! context network source {:x [:x] :y :y :epochs 5 :batch 13 :seed 31})))
 
 (deftest seeds-reproduce-initialization-shuffling-and-dropout
-  (with-open [db (table/open)]
+  (with-open [current-session (session/open)]
     (let [source (regression-table)]
-      (is (= (train-seeded-network! db source) (train-seeded-network! db source))))))
+      (is (= (update (train-seeded-network! current-session source) :history
+                     #(mapv (fn [entry] (dissoc entry :elapsed-milliseconds)) %))
+             (update (train-seeded-network! current-session source) :history
+                     #(mapv (fn [entry] (dissoc entry :elapsed-milliseconds)) %)))))))
 
 (deftest scalar-predictions-use-zero-threshold-and-stable-sigmoid
   (let [source (table/from {:x [-1000.0 -1.0 0.0 1.0 1000.0]})
         exponential (Math/exp -1.0)]
-    (with-open [db (table/open)
-                net (nn/build [:identity] {:input-shape [1]})]
-      (is (= [-1000.0 -1.0 0.0 1.0 1000.0]
-             (nn/predict net db source {:x [:x]})))
-      (is (= [0 0 0 1 1] (nn/predict net db source {:x [:x] :output :class})))
-      (is (= [0.0 (/ exponential (+ 1.0 exponential)) 0.5
-              (/ 1.0 (+ 1.0 exponential)) 1.0]
-             (nn/predict net db source {:x [:x] :output :probability}))))))
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session [:identity] {:input-shape [1]})]
+        (is (= [-1000.0 -1.0 0.0 1.0 1000.0]
+               (nn/predict current-session network source {:x [:x]})))
+        (is (= [0 0 0 1 1] (nn/predict current-session network source {:x [:x] :output :class})))
+        (is (= [0.0 (/ exponential (+ 1.0 exponential)) 0.5
+                (/ 1.0 (+ 1.0 exponential)) 1.0]
+               (nn/predict current-session network source {:x [:x] :output :probability})))))))
 
 (deftest vector-predictions-use-first-argmax-and-stable-softmax
   (let [source (table/from {:a [0.0 10.0 -1000.0 1000.0]
                             :b [0.0 10.0 1000.0 -1000.0]})]
-    (with-open [db (table/open)
-                net (nn/build [:identity] {:input-shape [2]})]
-      (is (= [[0.0 0.0] [10.0 10.0] [-1000.0 1000.0] [1000.0 -1000.0]]
-             (nn/predict net db source {:x [:a :b]})))
-      (is (= [0 0 1 0] (nn/predict net db source {:x [:a :b] :output :class})))
-      (is (= [[0.5 0.5] [0.5 0.5] [0.0 1.0] [1.0 0.0]]
-             (nn/predict net db source {:x [:a :b] :output :probability}))))))
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session [:identity] {:input-shape [2]})]
+        (is (= [[0.0 0.0] [10.0 10.0] [-1000.0 1000.0] [1000.0 -1000.0]]
+               (nn/predict current-session network source {:x [:a :b]})))
+        (is (= [0 0 1 0] (nn/predict current-session network source {:x [:a :b] :output :class})))
+        (is (= [[0.5 0.5] [0.5 0.5] [0.0 1.0] [1.0 0.0]]
+               (nn/predict current-session network source {:x [:a :b] :output :probability})))))))
 
 (deftest block-argument-validation-is-consistent
-  (testing "parameterized blocks report missing or surplus arguments"
-    (doseq [[spec error] [[[:activation] :nn/invalid-spec]
-                          [[:activation :relu :tanh] :nn/invalid-spec]
-                          [[:linear 1 2] :nn/invalid-linear]
-                          [[:dropout {} {}] :nn/invalid-dropout]
-                          [[:parallel {:combine :add}] :nn/invalid-combination]
-                          [[:skip {:combine :add}] :nn/invalid-combination]
-                          [[:skip {:combine :multiply} [:identity]] :nn/invalid-combination]]]
-      (is (= error (error-key #(nn/build spec {:input-shape [1]}))) (pr-str spec)))))
+  (with-open [current-session (session/open)]
+    (testing "parameterized blocks report missing or surplus arguments"
+      (doseq [[spec error] [[[:activation] :nn/invalid-spec]
+                            [[:activation :relu :tanh] :nn/invalid-spec]
+                            [[:linear 1 2] :nn/invalid-linear]
+                            [[:dropout {} {}] :nn/invalid-dropout]
+                            [[:parallel {:combine :add}] :nn/invalid-combination]
+                            [[:skip {:combine :add}] :nn/invalid-combination]
+                            [[:skip {:combine :multiply} [:identity]] :nn/invalid-combination]]]
+        (is (= error (error-key #(nn/build current-session spec {:input-shape [1]})))
+            (pr-str spec))))))
 
 (deftest invalid-dsl-and-options
-  (doseq [[spec error] [[[:unknown] :nn/unknown-tag]
-                        [[:linear {:units 2 :typo true}] :nn/unknown-option]
-                        [[:linear 0] :nn/invalid-linear]
-                        [[:linear 1.5] :nn/invalid-linear]
-                        [[:linear {:units 1 :bias? :yes}] :nn/invalid-linear]
-                        [[:dropout {:p 1}] :nn/invalid-dropout]
-                        [[:parallel {:combine :multiply} [:linear 1]] :nn/invalid-combination]
-                        [[:parallel {:combine :add :oops 1} [:linear 1]] :nn/unknown-option]
-                        [[:activation :unknown] :nn/invalid-activation]]]
-    (is (= error (error-key #(nn/build spec {:input-shape [1]})))))
-  (is (= :nn/unknown-option (error-key #(nn/build [:linear 1] {:input-shape [1] :oops 1}))))
-  (is (= :nn/invalid-input-shape (error-key #(nn/build [:linear 1] {:input-shape [0]}))))
-  (with-open [db (table/open)
-              net (nn/build [:linear 1] {:input-shape [1]})]
-    (let [source (regression-table)]
-      (is (= :nn/unknown-option (error-key #(nn/train! net db source {:x [:x] :y :y :oops true}))))
-      (is (= :nn/unknown-option (error-key #(nn/predict net db source {:x [:x] :oops true}))))
-      (is (= :nn/invalid-output (error-key #(nn/predict net db source {:x [:x] :output :unknown}))))
-      (is (= :nn/unknown-option (error-key #(nn/train! net db source {:x [:x] :y :y :optim [:adam {:lr 0.01 :oops 1}]}))))
-      (is (= :nn/invalid-features (error-key #(nn/predict net db source {:x [:x :y]})))))))
+  (with-open [current-session (session/open)]
+    (doseq [[spec error] [[[:unknown] :nn/unknown-tag]
+                          [[:linear {:units 2 :typo true}] :nn/unknown-option]
+                          [[:linear 0] :nn/invalid-linear]
+                          [[:linear 1.5] :nn/invalid-linear]
+                          [[:linear {:units 1 :bias? :yes}] :nn/invalid-linear]
+                          [[:dropout {:p 1}] :nn/invalid-dropout]
+                          [[:parallel {:combine :multiply} [:linear 1]] :nn/invalid-combination]
+                          [[:parallel {:combine :add :oops 1} [:linear 1]] :nn/unknown-option]
+                          [[:activation :unknown] :nn/invalid-activation]]]
+      (is (= error (error-key #(nn/build current-session spec {:input-shape [1]})))))
+    (is (= :nn/unknown-option
+           (error-key #(nn/build current-session [:linear 1] {:input-shape [1] :oops 1}))))
+    (is (= :nn/invalid-input-shape
+           (error-key #(nn/build current-session [:linear 1] {:input-shape [0]}))))
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1]})
+          source (regression-table)]
+      (is (= :nn/unknown-option
+             (error-key #(nn/train! current-session network source {:x [:x] :y :y :oops true}))))
+      (is (= :nn/unknown-option
+             (error-key #(nn/predict current-session network source {:x [:x] :oops true}))))
+      (is (= :nn/invalid-output
+             (error-key #(nn/predict current-session network source {:x [:x] :output :unknown}))))
+      (is (= :nn/unknown-option
+             (error-key #(nn/train! current-session network source
+                                    {:x [:x] :y :y :optim [:adam {:lr 0.01 :oops 1}]}))))
+      (is (= :nn/invalid-features
+             (error-key #(nn/predict current-session network source {:x [:x :y]})))))))
 
 (deftest native-dataset-training-improves-real-predictions
-  (with-open [^NDManager manager (tensor/manager {})
-              net (nn/build [:linear 1] {:input-shapes [[1 1]] :seed 41})]
-    (let [x (mapv #(/ % 20.0) (range -20 21))
-          truth (mapv #(+ 1 (* 2 %)) x)
-          ^NDArray features (tensor/array manager x {:shape [41 1] :dtype :float32})
-          ^NDArray labels (tensor/array manager truth {:shape [41 1] :dtype :float32})
+  (with-open [^Session current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1] {:input-shapes [[1 1]] :seed 41})
+          values (mapv #(/ % 20.0) (range -20 21))
+          truth (mapv #(+ 1 (* 2 %)) values)
+          ^NDArray features (tensor/array current-session values {:shape [41 1] :dtype :float32})
+          ^NDArray labels (tensor/array current-session truth {:shape [41 1] :dtype :float32})
           ^ArrayDataset$Builder builder (doto (ArrayDataset$Builder.)
                                           (.setData (into-array NDArray [features]))
                                           (.optLabels (into-array NDArray [labels]))
                                           (.setSampling (int 16) false))
           dataset (.build builder)
-          before (with-open [^NDList output (nn/predict net features {:manager manager})]
+          before (with-open [^NDList output (nn/predict current-session network features {})]
+                   (is (= (.manager current-session) (.getManager (.singletonOrThrow output))))
                    (vec (.toFloatArray (.singletonOrThrow output))))
-          ^TrainingResult result (nn/train! net dataset
-                                            {:epochs 100 :validation dataset
-                                             :config (training/config
-                                                      {:device :cpu :optim [:adam {:lr 0.05}]})})
-          after (with-open [^NDList output (nn/predict net features {:manager manager})]
+          result (nn/train! current-session network dataset
+                            {:epochs 100 :validation dataset
+                             :config (training/config {:device :cpu :optim [:adam {:lr 0.05}]})})
+          after (with-open [^NDList output (nn/predict current-session network features {})]
                   (vec (.toFloatArray (.singletonOrThrow output))))]
       (is (< (mse after truth) (* 0.05 (mse before truth))))
       (is (< (mse after truth) 0.05))
-      (is (= 100 (.getEpoch result)))
-      (is (some? (.getTrainLoss result)))
-      (is (< (.getValidateLoss result) 0.05))
-      (is (= (mapv float x) (vec (.toFloatArray features))))
+      (is (= 100 (count (:history result))))
+      (is (= #{:history :best :stopped} (set (keys result))))
+      (is (= :completed (:stopped result)))
+      (is (Double/isFinite (double (:training-loss (last (:history result))))))
+      (is (< (:validation-loss (last (:history result))) 0.05))
+      (is (Double/isFinite (double (:mae (nn/evaluate current-session network dataset {:metrics [:mae]})))))
+      (is (= (mapv float values) (vec (.toFloatArray features))))
       (is (= 41 (.size labels)))
       ;; Reusing the same caller dataset exercises its lifetime after Trainer.close.
       (is (= :nn/device-mismatch
-             (error-key #(nn/train! net dataset
+             (error-key #(nn/train! current-session network dataset
                                     {:config (-> (DefaultTrainingConfig. (training/loss :mse))
                                                  (.optDevices (into-array Device
                                                                           [(Device/gpu Integer/MAX_VALUE)])))}))))
       (is (= :nn/invalid-training-options
-             (error-key #(nn/train! net dataset {:config :invalid}))))
-      (is (= :nn/invalid-manager (error-key #(nn/predict net features {}))))
+             (error-key #(nn/train! current-session network dataset {:config :invalid}))))
+      (is (= :nn/invalid-manager
+             (error-key #(nn/predict current-session network features {:manager :invalid}))))
       (is (= :nn/unknown-option
-             (error-key #(nn/train! net dataset {:epochs 1 :batch 16}))))
-      (is (instance? TrainingResult (nn/train! net dataset {:epochs 1}))))))
+             (error-key #(nn/train! current-session network dataset {:epochs 1 :batch 16}))))
+      (is (= :completed (:stopped (nn/train! current-session network dataset {:epochs 1}))))
+      (let [handle (nn/trainer current-session network dataset {:epochs 4})]
+        (try
+          (is (= {:network nil :epochs 4 :batch nil :validation? false :early-stopping nil}
+                 (datafy/datafy handle)))
+          (finally (session/release! current-session handle))))
+      (is (= [:network] (mapv :kind (:resources (session/describe current-session))))))))
 
 (deftest multidimensional-native-predictions-outlive-network-and-preserve-inputs
-  (with-open [^NDManager manager (tensor/manager {})]
-    (let [^NDArray input (tensor/array manager (range 12)
-                                       {:shape [2 2 3] :dtype :float64})
-          ^NDList output (with-open [net (nn/build [:identity]
-                                                   {:input-shape [2 3] :dtype :float64})]
-                           (is (= [[1 2 3]] (:input-shapes net)))
-                           (nn/predict net (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
-                                       {:manager manager}))]
+  (with-open [^Session owner (session/open)]
+    (let [^NDManager manager (.manager owner)
+          ^NDArray input (tensor/array owner (range 12) {:shape [2 2 3] :dtype :float64})
+          ^NDList output
+          (with-open [current-session (session/open)]
+            (let [network (nn/build current-session [:identity]
+                                    {:input-shape [2 3] :dtype :float64})]
+              (is (= [[1 2 3]] (:input-shapes network)))
+              (nn/predict current-session network
+                          (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+                          {:manager manager})))]
       (with-open [output output]
         (let [^NDArray result (.singletonOrThrow output)]
           (is (= [2 2 3] (vec (.getShape (.getShape result)))))
@@ -297,12 +339,13 @@
   (let [spec [:lambda (fn [^NDList inputs]
                         (let [^NDArray left (.get inputs (int 0))
                               ^NDArray right (.get inputs (int 1))]
-                          (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [(.add left right) (.sub left right)]))))]]
-    (with-open [^NDManager manager (tensor/manager {})
-                net (nn/build spec {:input-shapes [[1 2] [1 2]]})]
-      (let [^NDArray left (tensor/array manager [[1 2] [3 4]] {:dtype :float32})
-            ^NDArray right (tensor/array manager [[10 20] [30 40]] {:dtype :float32})]
-        (with-open [^NDList output (nn/predict net [left right] {:manager manager})]
+                          (NDList. ^"[Lai.djl.ndarray.NDArray;"
+                           (into-array NDArray [(.add left right) (.sub left right)]))))]]
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session spec {:input-shapes [[1 2] [1 2]]})
+            ^NDArray left (tensor/array current-session [[1 2] [3 4]] {:dtype :float32})
+            ^NDArray right (tensor/array current-session [[10 20] [30 40]] {:dtype :float32})]
+        (with-open [^NDList output (nn/predict current-session network [left right] {})]
           (is (= 2 (.size output)))
           (is (= [11.0 22.0 33.0 44.0] (vec (.toFloatArray ^NDArray (.get output (int 0))))))
           (is (= [-9.0 -18.0 -27.0 -36.0] (vec (.toFloatArray ^NDArray (.get output (int 1)))))))
@@ -317,111 +360,490 @@
                                       {:data input :shape [1 2] :dtype :float32}))
                      (processOutput [_ _ output]
                        (reduce + (.toFloatArray (.singletonOrThrow ^NDList output)))))]
-    (with-open [net (nn/build [:identity] {:input-shape [2]})]
-      (is (= 7.0 (nn/predict-with net translator [3 4])))))
-  (with-open [^NDManager manager (tensor/manager {})]
-    (let [^NDArray input (tensor/array manager [[3 4]] {:dtype :float32})
-          ^NDList result (with-open [net (nn/build [:identity] {:input-shape [2]})]
-                           (nn/predict-with net (NoopTranslator. nil)
-                                            (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))))]
-      (with-open [result result]
-        (is (= [3.0 4.0] (vec (.toFloatArray (.singletonOrThrow result))))))
+    (with-open [current-session (session/open)]
+      (let [network (nn/build current-session [:identity] {:input-shape [2]})]
+        (is (= 7.0 (nn/predict-with current-session network translator [3 4]))))))
+  (with-open [^Session owner (session/open)]
+    (let [^NDArray input (tensor/array owner [[3 4]] {:dtype :float32})
+          {:keys [manager outputs]}
+          (with-open [^Session current-session (session/open)]
+            (let [network (nn/build current-session [:identity] {:input-shape [2]})
+                  inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+                  array-translator (reify Translator
+                                     (getBatchifier [_] nil)
+                                     (processInput [_ _ value] value)
+                                     (processOutput [_ _ output] (.singletonOrThrow ^NDList output)))
+                  ^NDList list-output (nn/predict-with current-session network (NoopTranslator. nil) inputs)
+                  ^NDArray array-output (nn/predict-with current-session network array-translator inputs)
+                  ^NDArray list-array (.singletonOrThrow list-output)
+                  outputs [list-array array-output]]
+              (is (every? #(identical? (.manager current-session) (.getManager ^NDArray %)) outputs))
+              (session/release! current-session network)
+              (is (= [[3.0 4.0] [3.0 4.0]]
+                     (mapv #(vec (.toFloatArray ^NDArray %)) outputs)))
+              (.addi array-output (Float/valueOf (float 10)))
+              (is (= [3.0 4.0] (vec (.toFloatArray input))))
+              (is (= [3.0 4.0] (vec (.toFloatArray list-array))))
+              {:manager (.manager current-session) :outputs outputs}))]
+      (is (false? (.isOpen ^NDManager manager)))
+      (is (every? #(.isReleased ^NDArray %) outputs))
       (is (= [3.0 4.0] (vec (.toFloatArray input)))))))
 
 (defn- with-temporary-directory! [operation]
-  (let [dir (.toFile (Files/createTempDirectory "garun-native-test-"
-                                                (make-array FileAttribute 0)))]
+  (let [directory (.toFile (Files/createTempDirectory "garun-native-test-"
+                                                      (make-array FileAttribute 0)))]
     (try
-      (operation dir)
+      (operation directory)
       (finally
-        (doseq [^java.io.File file (reverse (file-seq dir))]
+        (doseq [^java.io.File file (reverse (file-seq directory))]
           (.delete file))))))
 
 (deftest custom-reconstruction-is-explicit-and-round-trips-parameters
   (let [spec [:factory #(blocks/compile-block [:linear 1])]]
     (with-temporary-directory!
-      (fn [dir]
-        (with-open [db (table/open)
-                    ^NDManager manager (tensor/manager {})
-                    net (nn/build spec {:input-shape [1]})]
-          (is (= :nn/nonserializable-spec (error-key #(nn/save! net dir))))
-          (is (empty? (.listFiles ^java.io.File dir)))
-          (nn/train! net db (regression-table)
-                     {:x [:x] :y :y :epochs 100 :optim [:adam {:lr 0.05}]})
-          (let [input {:data [[0.0] [1.0]] :dtype :float32}
-                before (with-open [^NDList output (nn/predict net input {:manager manager})]
-                         (vec (.toFloatArray (.singletonOrThrow output))))]
-            (nn/save! net dir {:spec spec})
-            (is (= :nn/missing-reconstruction-spec (error-key #(nn/load dir))))
-            (with-open [^Network restored (nn/load dir {:spec spec :device :cpu})
-                        ^NDList output (nn/predict restored input {:manager manager})]
-              (is (= before (vec (.toFloatArray (.singletonOrThrow output))))))
-            (nn/save! net dir {:spec [:linear 1]})
-            (with-open [^Network restored (nn/load dir)
-                        ^NDList output (nn/predict restored input {:manager manager})]
-              (is (= [:linear 1] (:spec restored)))
-              (is (= before (vec (.toFloatArray (.singletonOrThrow output))))))))))))
+      (fn [directory]
+        (with-open [current-session (session/open)]
+          (let [network (nn/build current-session spec {:input-shape [1]})]
+            (is (= :nn/nonserializable-spec
+                   (error-key #(nn/save! current-session network directory))))
+            (is (empty? (.listFiles ^java.io.File directory)))
+            (nn/train! current-session network (regression-table)
+                       {:x [:x] :y :y :epochs 100 :optim [:adam {:lr 0.05}]})
+            (let [input {:data [[0.0] [1.0]] :dtype :float32}
+                  before (with-open [^NDList output (nn/predict current-session network input {})]
+                           (vec (.toFloatArray (.singletonOrThrow output))))]
+              (nn/save! current-session network directory {:spec spec})
+              (is (= :nn/missing-reconstruction-spec
+                     (error-key #(nn/load current-session directory))))
+              (let [restored (nn/load current-session directory {:spec spec :device :cpu})]
+                (with-open [^NDList output (nn/predict current-session restored input {})]
+                  (is (= before (vec (.toFloatArray (.singletonOrThrow output)))))))
+              (nn/save! current-session network directory {:spec [:linear 1]})
+              (let [restored (nn/load current-session directory)]
+                (with-open [^NDList output (nn/predict current-session restored input {})]
+                  (is (= [:linear 1] (:spec restored)))
+                  (is (= before (vec (.toFloatArray (.singletonOrThrow output))))))))))))))
 
 (deftest dtype-device-validation-and-saved-overrides
-  (is (= :tensor/invalid-dtype
-         (error-key #(nn/build [:identity] {:input-shape [1] :dtype :decimal128}))))
-  (is (= :tensor/unsupported-dtype
-         (error-key #(nn/build [:linear 1] {:input-shape [1] :dtype :bfloat16}))))
-  (is (= :tensor/unavailable-device
-         (error-key #(nn/build [:identity] {:input-shape [1] :device [:gpu Integer/MAX_VALUE]}))))
-  (is (= :nn/invalid-input-shape
-         (error-key #(nn/build [:identity] {:input-shape [1] :input-shapes [[1 1]]}))))
-  (with-open [db (table/open)
-              net (nn/build [:identity] {:input-shape [2 3]})]
-    (is (= :nn/non-tabular-input
-           (error-key #(nn/predict net db (regression-table) {:x [:x]}))))
-    (is (= :nn/non-tabular-input
-           (error-key #(nn/train! net db (regression-table) {:x [:x] :y :y})))))
-  (with-open [db (table/open)
-              net (nn/build [:identity] {:input-shape [1] :dtype :float64})]
-    (is (= :nn/non-tabular-dtype
-           (error-key #(nn/predict net db (regression-table) {:x [:x]})))))
+  (with-open [current-session (session/open)]
+    (is (= :tensor/invalid-dtype
+           (error-key #(nn/build current-session [:identity] {:input-shape [1] :dtype :decimal128}))))
+    (is (= :tensor/unsupported-dtype
+           (error-key #(nn/build current-session [:linear 1] {:input-shape [1] :dtype :bfloat16}))))
+    (is (= :tensor/unavailable-device
+           (error-key #(nn/build current-session [:identity]
+                                 {:input-shape [1] :device [:gpu Integer/MAX_VALUE]}))))
+    (is (= :nn/invalid-input-shape
+           (error-key #(nn/build current-session [:identity] {:input-shape [1] :input-shapes [[1 1]]}))))
+    (let [network (nn/build current-session [:identity] {:input-shape [2 3]})]
+      (is (= :nn/non-tabular-input
+             (error-key #(nn/predict current-session network (regression-table) {:x [:x]}))))
+      (is (= :nn/non-tabular-input
+             (error-key #(nn/train! current-session network (regression-table) {:x [:x] :y :y})))))
+    (let [network (nn/build current-session [:identity] {:input-shape [1] :dtype :float64})]
+      (is (= :nn/non-tabular-dtype
+             (error-key #(nn/predict current-session network (regression-table) {:x [:x]}))))))
   (with-temporary-directory!
-    (fn [dir]
-      (with-open [net (nn/build [:linear 1] {:input-shape [1] :dtype :float64
-                                             :engine "PyTorch"})]
-        (nn/save! net dir))
+    (fn [directory]
+      (with-open [current-session (session/open)]
+        (let [network (nn/build current-session [:linear 1]
+                                {:input-shape [1] :dtype :float64 :engine "PyTorch"})]
+          (nn/save! current-session network directory)))
       ;; Simulate a portable saved GPU preference without requiring CUDA hardware.
-      (let [file (io/file dir "spec.edn")
+      (let [file (io/file directory "spec.edn")
             metadata (edn/read-string (slurp file))]
         (spit file (pr-str (assoc metadata :device [:gpu Integer/MAX_VALUE]))))
-      (is (= :tensor/unavailable-device (error-key #(nn/load dir))))
-      (with-open [^NDManager manager (tensor/manager {})
-                  ^Network restored (nn/load dir {:device (Device/cpu)})
-                  ^NDList output (nn/predict restored {:data [[1.0]] :dtype :float64}
-                                             {:manager manager})]
-        (is (= DataType/FLOAT64 (:dtype restored)))
-        (is (= (Device/cpu) (.getDevice (.getNDManager ^Model (:model restored)))))
-        (is (= DataType/FLOAT64 (.getDataType (.singletonOrThrow output)))))
-      (with-open [^NDManager manager (tensor/manager {})
-                  ^Network restored (nn/load dir {:device :cpu :dtype :float32})
-                  ^NDList output (nn/predict restored {:data [[1.0]] :dtype :float32}
-                                             {:manager manager})]
-        (is (= DataType/FLOAT32 (.getDataType (.singletonOrThrow output))))))))
+      (with-open [current-session (session/open)]
+        (is (= :tensor/unavailable-device (error-key #(nn/load current-session directory))))
+        (let [restored (nn/load current-session directory {:device (Device/cpu)})]
+          (with-open [^NDList output
+                      (nn/predict current-session restored {:data [[1.0]] :dtype :float64} {})]
+            (is (= DataType/FLOAT64 (:dtype restored)))
+            (is (= (Device/cpu) (.getDevice (.getNDManager ^Model (:model restored)))))
+            (is (= DataType/FLOAT64 (.getDataType (.singletonOrThrow output))))))
+        (let [restored (nn/load current-session directory {:device :cpu :dtype :float32})]
+          (with-open [^NDList output
+                      (nn/predict current-session restored {:data [[1.0]] :dtype :float32} {})]
+            (is (= DataType/FLOAT32 (.getDataType (.singletonOrThrow output))))))))))
 
 (deftest native-integer-identity-preserves-exact-values
-  (with-open [^NDManager manager (tensor/manager {})
-              net (nn/build [:identity] {:input-shapes [(Shape. (long-array [1 2]))]
-                                         :dtype DataType/INT64})]
-    (let [values [9007199254740993 9007199254740995]
-          ^NDArray input (tensor/array manager values {:shape [1 2] :dtype :int64})]
-      (with-open [^NDList output (nn/predict net input {:manager manager})]
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:identity]
+                            {:input-shapes [(Shape. (long-array [1 2]))] :dtype DataType/INT64})
+          values [9007199254740993 9007199254740995]
+          ^NDArray input (tensor/array current-session values {:shape [1 2] :dtype :int64})]
+      (with-open [^NDList output (nn/predict current-session network input {})]
         (is (= DataType/INT64 (.getDataType (.singletonOrThrow output))))
         (is (= values (vec (.toLongArray (.singletonOrThrow output))))))
       (is (= values (vec (.toLongArray input)))))))
 
 (deftest native-scalar-and-empty-tensor-shapes
-  (with-open [manager (tensor/manager {:device :cpu})
-              scalar (nn/build [:identity] {:input-shapes [[]]})
-              empty (nn/build [:identity] {:input-shapes [[0 2]]})]
-    (with-open [^NDList output (nn/predict scalar {:data 7.5 :dtype :float32} {:manager manager})]
-      (is (= [] (vec (.getShape (.getShape (.singletonOrThrow output))))))
-      (is (= [7.5] (vec (.toFloatArray (.singletonOrThrow output))))))
-    (with-open [^NDList output (nn/predict empty {:data [] :shape [0 2] :dtype :float32} {:manager manager})]
-      (is (= [0 2] (vec (.getShape (.getShape (.singletonOrThrow output))))))
-      (is (= [] (vec (.toFloatArray (.singletonOrThrow output))))))))
+  (with-open [current-session (session/open {:device :cpu})]
+    (let [scalar (nn/build current-session [:identity] {:input-shapes [[]]})
+          empty-network (nn/build current-session [:identity] {:input-shapes [[0 2]]})]
+      (with-open [^NDList output (nn/predict current-session scalar {:data 7.5 :dtype :float32} {})]
+        (is (= [] (vec (.getShape (.getShape (.singletonOrThrow output))))))
+        (is (= [7.5] (vec (.toFloatArray (.singletonOrThrow output))))))
+      (with-open [^NDList output
+                  (nn/predict current-session empty-network {:data [] :shape [0 2] :dtype :float32} {})]
+        (is (= [0 2] (vec (.getShape (.getShape (.singletonOrThrow output))))))
+        (is (= [] (vec (.toFloatArray (.singletonOrThrow output)))))))))
+
+(deftest named-networks-train-and-predict-through-the-session
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1]
+                            {:input-shape [1] :name :regression :seed 11})
+          source (regression-table)
+          before (nn/predict current-session :regression source {:x [:x]})
+          {:keys [history]} (nn/train! current-session :regression source
+                                       {:x [:x] :y :y :epochs 5 :batch 16})
+          predictions (nn/predict current-session :regression source {:x [:x]})]
+      (is (= 5 (count history)))
+      (is (not= before predictions))
+      (is (= predictions (nn/predict current-session network source {:x [:x]}))))))
+
+(deftest network-inspection-is-readable-plain-data
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 2] {:input-shape [3]})
+          description (datafy/datafy network)
+          printed (with-out-str (prn network))]
+      (is (string/starts-with? printed "#garun/network "))
+      (is (string/includes? printed ":spec [:linear 2]"))
+      (is (string/includes? printed ":dtype :float32"))
+      (is (= {:spec [:linear 2] :input-shapes [[1 3]] :dtype :float32
+              :device :cpu :engine "PyTorch" :parameters 8}
+             description)))))
+
+(deftest closing-a-session-closes-its-owned-network-manager
+  (let [^NDManager model-manager
+        (with-open [current-session (session/open)]
+          (let [network (nn/build current-session [:linear 1] {:input-shape [1]})
+                ^NDManager manager (.getNDManager ^Model (:model network))]
+            (is (.isOpen manager))
+            manager))]
+    (is (not (.isOpen model-manager)))))
+
+(deftest workers-share-networks-and-materialized-table-predictions
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1] :name :regression})
+          source (table/materialize! current-session :training-data (regression-table))
+          predictions (nn/predict current-session network source {:x [:x]})]
+      (with-open [worker (session/worker current-session)]
+        (is (= predictions (nn/predict worker :regression :training-data {:x [:x]})))))))
+
+(deftest loading-registers-a-network-under-its-name
+  (with-temporary-directory!
+    (fn [directory]
+      (with-open [current-session (session/open)]
+        (let [network (nn/build current-session [:linear 1] {:input-shape [1]})
+              source (regression-table)
+              predictions (nn/predict current-session network source {:x [:x]})]
+          (nn/save! current-session network directory)
+          (let [restored (nn/load current-session directory {:name :restored})]
+            (is (= [:linear 1] (:spec restored)))
+            (is (= predictions (nn/predict current-session :restored source {:x [:x]})))
+            (is (= predictions (nn/predict current-session restored source {:x [:x]})))))))))
+
+(deftest build-inherits-session-defaults-and-registration-errors-are-loud
+  (with-open [current-session (session/open {:dtype :float64 :seed 37})]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1] :name :regression})
+          ^NDManager original-manager (.getNDManager ^Model (:model network))]
+      (is (= DataType/FLOAT64 (:dtype network)))
+      (is (= :session/duplicate-name
+             (error-key #(nn/build current-session [:linear 1]
+                                   {:input-shape [1] :name :regression}))))
+      (is (.isOpen original-manager))
+      (nn/build current-session [:identity]
+                {:input-shape [1] :name :regression :replace? true})
+      (is (not (.isOpen original-manager)))
+      (is (= :session/unknown-name
+             (error-key #(nn/predict current-session :missing [[1.0]] {})))))))
+
+(defn- sequence-table [shift]
+  (table/from
+   (vec (reverse
+         (for [[partition row-count] [["battery-c" 2] ["battery-a" 6] ["battery-b" 5]]
+               cycle (range row-count)
+               :let [value (+ shift cycle)]]
+           {:battery partition :cycle cycle :x value :y (+ 100.0 (* 20.0 value))})))))
+
+(deftest sequence-windows-use-exact-window-end-flags-and-never-cross-string-partitions
+  (with-open [current-session (session/open)]
+    (let [partitions [["battery-a" 6 11] ["battery-b" 2 22] ["battery-c" 5 33]
+                      ["battery-d" 1 44] ["battery-e" 3 55]]
+          source (table/from
+                  (vec (reverse
+                        (for [[battery rows feature] partitions
+                              cycle (range rows)]
+                          {:battery battery :cycle cycle :x feature :y (+ (* feature 100) cycle)}))))
+          specification {:x [:x] :y :y :sequence {:length 3 :partition-by :battery :order-by :cycle}}
+          queries (ConcurrentLinkedQueue.)
+          extract-matrix table/matrix
+          extracted (with-redefs [table/matrix (fn [context source columns]
+                                                 (.add queries (first (table/->sql context source)))
+                                                 (extract-matrix context source columns))]
+                      (examples/table-examples current-session source specification true))
+          expected-features (mapcat (fn [[_ rows feature]] (repeat (max 0 (- rows 2)) (float feature)))
+                                    partitions)
+          expected-labels (mapcat (fn [[_ rows feature]]
+                                    (map #(float (+ (* feature 100) %)) (range 2 rows)))
+                                  partitions)
+          windows (partition 3 (:data (:features extracted)))]
+      (is (= 8 (reduce + (map (fn [[_ rows _]] (max 0 (- rows 2))) partitions))
+             (:rows extracted) (count windows)))
+      (is (= [8 3 1] (get-in extracted [:features :shape])))
+      (is (every? #(apply = %) windows))
+      (is (= (vec expected-features) (mapv first windows)))
+      (is (= (vec expected-labels) (vec (get-in extracted [:labels :data]))))
+      (is (= 1 (.size queries)))
+      (is (string/includes? (.peek queries) "ROW_NUMBER()"))
+      (is (not (string/includes? (.peek queries) "DENSE_RANK"))))))
+
+(def ^:private sequence-options
+  {:x [:x] :y :y :sequence {:length 3 :partition-by :battery :order-by :cycle}
+   :standardize [:x :y] :epochs 140 :batch 7 :shuffle? false
+   :optim [:adam {:lr 0.08}]})
+
+(defn- network-inputs [network]
+  (edn/read-string (.getProperty ^Model (:model network) "garun.inputs")))
+
+(deftest sequence-regression-observation-evaluation-and-stored-input-roundtrip
+  (with-temporary-directory!
+    (fn [directory]
+      (with-open [current-session (session/open {:seed 2026})]
+        (let [source (sequence-table 0.0)
+              validation (sequence-table 0.2)
+              network (nn/build current-session [:sequential [:last-step] [:linear 1]]
+                                {:input-shape [3 1] :name :sequence})
+              events (ConcurrentLinkedQueue.)
+              result (nn/train! current-session :sequence source
+                                (assoc sequence-options :validation validation
+                                       :metrics [:mae] :observe #(.add events %)))
+              history (:history result)
+              predictions (nn/predict current-session :sequence validation {})
+              evaluation (nn/evaluate current-session :sequence validation {:metrics [:mae :mse :r2]})
+              observed (vec events)
+              expected-windows (reduce + (map #(max 0 (inc (- % 3))) [6 5 2]))]
+          (is (= 7 expected-windows (count predictions)))
+          (is (< (:validation-loss (last history)) (:validation-loss (first history))))
+          (is (Double/isFinite (double (:mae evaluation))))
+          (is (< (:mae evaluation) 5.0))
+          (is (every? #(> % 90.0) predictions))
+          (is (= (mapv #(assoc % :event :epoch :network :sequence) history) (pop observed)))
+          (is (= {:event :finished :stopped (:stopped result) :best (:best result)} (peek observed)))
+          (is (every? #(Double/isFinite (double (get-in % [:metrics :mae]))) history))
+          (is (= [:network] (mapv :kind (:resources (session/describe current-session)))))
+          (is (nil? (.getProperty ^Model (:model network) "garun.training")))
+          (nn/save! current-session :sequence directory)
+          (let [loaded (nn/load current-session directory)]
+            (is (= (network-inputs network) (network-inputs loaded)))
+            (is (nil? (.getProperty ^Model (:model loaded) "garun.training")))
+            (is (= predictions (nn/predict current-session loaded validation {})))))))))
+
+(deftest early-stopping-restores-the-best-device-parameters
+  (with-open [current-session (session/open)]
+    (let [source (regression-table)
+          network (nn/build current-session [:linear 1] {:input-shape [1] :seed 101})
+          ^Model model (:model network)
+          snapshots (mapv (fn [^Parameter parameter] (.duplicate (.getArray parameter)))
+                          (.values (.getParameters (.getBlock model))))
+          events (ConcurrentLinkedQueue.)
+          result (nn/train! current-session network source
+                            {:x [:x] :y :y :validation source :epochs 20 :batch 41
+                             :shuffle? false :optim [:sgd {:lr [:fixed {:value 0.0}]}]
+                             :early-stopping {:patience 1 :restore-best? true}
+                             :observe (fn [event]
+                                        (.add events event)
+                                        ;; Perturb after the plateau is observed. Restore
+                                        ;; must undo it, not merely retain final weights.
+                                        (when (and (= :epoch (:event event)) (= 2 (:epoch event)))
+                                          (doseq [^Parameter parameter
+                                                  (.values (.getParameters (.getBlock model)))]
+                                            (.addi (.getArray parameter) (Float/valueOf (float 10))))))})
+          evaluation (nn/evaluate current-session network source {})]
+      (try
+        (is (= :early-stopping (:stopped result)))
+        (is (= 2 (count (:history result))))
+        (is (= {:epoch 1 :loss (:validation-loss (first (:history result))) :monitor :validation-loss}
+               (:best result)))
+        (is (< (Math/abs (double (- (:loss evaluation) (get-in result [:best :loss])))) 1.0e-6))
+        (is (every? true? (map (fn [^Parameter parameter ^NDArray snapshot]
+                                 (.allClose (.getArray parameter) snapshot 1.0e-7 1.0e-7 false))
+                               (.values (.getParameters (.getBlock model))) snapshots)))
+        (is (= [:epoch :epoch :finished] (mapv :event events)))
+        (finally (doseq [^NDArray snapshot snapshots] (.close snapshot)))))))
+
+(deftest standardization-uses-training-aggregates-and-original-target-units
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1]})
+          ^Model model (:model network)
+          ^Block block (.getBlock model)
+          ^Parameter weight (.get (.getDirectParameters block) "weight")
+          ^Parameter bias (.get (.getDirectParameters block) "bias")
+          source (table/from {:x [0.0 1.0 2.0 3.0] :y [50.0 70.0 90.0 110.0]})
+          validation (table/from {:x [100.0 101.0 102.0 103.0] :y [2050.0 2070.0 2090.0 2110.0]})]
+      (.set (.getArray weight) (float-array [0.5]))
+      (.set (.getArray bias) (float-array [0.0]))
+      (nn/train! current-session network source
+                 {:x [:x] :y :y :standardize [:x :y] :validation validation
+                  :epochs 1 :batch 4 :optim [:sgd {:lr [:fixed {:value 0.0}]}]})
+      (let [statistics (:statistics (network-inputs network))
+            predictions (nn/predict current-session network source {})]
+        (is (= 1.5 (get-in statistics [:x 0 :mean])))
+        (is (= 80.0 (get-in statistics [:y 0 :mean])))
+        (is (< (Math/abs (- (Math/sqrt 1.25)
+                            (get-in statistics [:x 0 :standard-deviation]))) 1.0e-12))
+        (is (< (mse predictions [65.0 75.0 85.0 95.0]) 1.0e-8))
+        (is (= [0.0 0.5 1.0 1.5]
+               (nn/predict current-session network source {:standardize []})))
+        (is (= 4 (count (nn/predict current-session network validation {}))))))))
+
+(deftest lower-training-layer-supports-user-reductions-and-custom-metrics
+  (with-open [current-session (session/open)]
+    (let [source (regression-table)
+          network (nn/build current-session [:linear 1] {:input-shape [1] :name :custom})
+          constant-metric (fn [_predictions _truth] 42.0)
+          closed-trainers (ConcurrentLinkedQueue.)
+          listener (proxy [TrainingListenerAdapter] []
+                     (onTrainingEnd [native-trainer] (.add closed-trainers native-trainer)))
+          handle (nn/trainer current-session :custom source
+                             {:x [:x] :y :y :validation source :epochs 50 :batch 41
+                              :metrics [constant-metric] :listeners [listener]
+                              :optim [:sgd {:lr [:fixed {:value 0.0}]}]})
+          description {:network :custom :epochs 50 :batch 41 :validation? true :early-stopping nil}]
+      (try
+        (is (identical? network (:network handle)))
+        (is (= description (datafy/datafy handle)))
+        (let [state (reduce (fn [state _]
+                              (let [state (nn/epoch! handle state)]
+                                (if (= 3 (:epoch state)) (reduced state) state)))
+                            {} (range 50))
+              validation (nn/validate handle)]
+          (is (= 3 (:epoch state) (count (:history state))))
+          (is (= [42.0 42.0 42.0] (mapv #(get-in % [:metrics :metric-0]) (:history state))))
+          (is (= 42.0 (get-in validation [:metrics :metric-0])))
+          (is (= state (nn/restore-best! handle state)))
+          (is (= description (datafy/datafy handle)))
+          (is (= handle (session/value current-session handle :trainer))))
+        (finally (session/release! current-session handle)))
+      (is (nil? (session/resource current-session handle :trainer)))
+      (is (false? (.isOpen (.getManager ^Trainer (:native-trainer handle)))))
+      (is (false? (.isOpen ^NDManager (:snapshot-manager handle))))
+      ;; Release already closed the handle; repeated close must remain harmless.
+      (.close ^java.lang.AutoCloseable handle)
+      (.close ^java.lang.AutoCloseable handle)
+      (is (= [(:native-trainer handle)] (vec closed-trainers)))
+      (is (= description (datafy/datafy handle))))))
+
+(deftest training-operations-acquire-network-before-the-anonymous-trainer
+  (with-open [current-session (session/open)
+              worker (session/worker current-session)]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1] :name :lock-order})
+          handle (nn/trainer worker :lock-order (regression-table)
+                             {:x [:x] :y :y :epochs 1 :batch 41})
+          exclusive session/exclusive]
+      (try
+        ;; A held network must block each native training operation before it even
+        ;; attempts the trainer lock. Latches observe admission; every wait is bounded.
+        (doseq [operation [nn/validate #(nn/epoch! % {}) #(nn/restore-best! % {})]]
+          (let [network-attempted (CountDownLatch. (int 1))
+                trainer-attempted (CountDownLatch. (int 1))]
+            (with-redefs [session/exclusive
+                          (fn [context value kind callback]
+                            (when (and (= :network kind) (identical? network value))
+                              (.countDown network-attempted))
+                            (when (and (= :trainer kind) (identical? handle value))
+                              (.countDown trainer-attempted))
+                            (exclusive context value kind callback))]
+              (let [[^CompletableFuture result ^CompletableFuture trainer-result]
+                    (exclusive
+                     current-session network :network
+                     (fn [_]
+                       (let [result (CompletableFuture/supplyAsync
+                                     (reify Supplier
+                                       (get [_] (operation handle))))]
+                         (is (.await network-attempted (long 10) TimeUnit/SECONDS))
+                         (is (thrown? TimeoutException (.get result (long 100) TimeUnit/MILLISECONDS)))
+                         (is (= 1 (.getCount trainer-attempted)))
+                         (let [trainer-result (CompletableFuture/supplyAsync
+                                               (reify Supplier
+                                                 (get [_]
+                                                   (exclusive current-session handle :trainer
+                                                              (constantly :available)))))]
+                           (is (= :available (.get trainer-result (long 1) TimeUnit/SECONDS)))
+                           [result trainer-result]))))]
+                (is (map? (.get result (long 10) TimeUnit/SECONDS)))
+                (.get trainer-result (long 10) TimeUnit/SECONDS)
+                (is (zero? (.getCount trainer-attempted)))))))
+        (finally (session/release! current-session handle))))))
+
+(deftest custom-stopping-functional-loss-and-forward-share-the-loop
+  (with-open [current-session (session/open)]
+    (let [source (regression-table)
+          network (nn/build current-session [:linear 1] {:input-shape [1]})
+          functional-loss (fn [^NDList labels ^NDList predictions]
+                            (.mean (.square (.sub (.singletonOrThrow predictions)
+                                                  (.singletonOrThrow labels)))))
+          result (nn/train! current-session network source
+                            {:x [:x] :y :y :epochs 30 :batch 41 :validation source
+                             :loss functional-loss :optim [:adam {:lr 0.02}]
+                             :forward (fn [^Trainer native-trainer inputs training?]
+                                        (if training? (.forward native-trainer ^NDList inputs)
+                                            (.evaluate native-trainer ^NDList inputs)))
+                             :stop? #(>= (:epoch %) 3)})]
+      (is (= :early-stopping (:stopped result)))
+      (is (= 3 (count (:history result))))
+      (is (every? #(Double/isFinite (double (:training-loss %))) (:history result))))))
+
+(deftest observers-abort-and-extension-options-fail-loudly
+  (with-open [current-session (session/open)]
+    (let [source (regression-table)
+          network (nn/build current-session [:linear 1] {:input-shape [1]})
+          options {:x [:x] :y :y :epochs 2 :batch 41}]
+      (doseq [failed-event [:epoch :finished]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"observer-failure"
+                              (nn/train! current-session network source
+                                         (assoc options :observe
+                                                (fn [event]
+                                                  (when (= failed-event (:event event))
+                                                    (throw (ex-info "observer-failure" {:sentinel true}))))))))
+        (is (= [:network] (mapv :kind (:resources (session/describe current-session))))))
+      (doseq [extension [:observe :forward :stop?]]
+        (is (= :nn/invalid-training-options
+               (error-key #(nn/trainer current-session network source (assoc options extension :invalid))))))
+      (is (= :nn/invalid-metrics
+             (error-key #(nn/train! current-session network source (assoc options :metrics [:unknown])))))
+      (is (= :nn/missing-statistics
+             (error-key #(nn/predict current-session network source {:standardize [:x]}))))
+      (is (= :nn/unknown-option
+             (error-key #(nn/train! current-session network source
+                                    (assoc options :sequence {:length 3 :partition-by :x
+                                                              :order-by :x :typo true})))))
+      (is (= :nn/unknown-option
+             (error-key #(nn/train! current-session network source
+                                    (assoc options :early-stopping {:patience 1 :typo true}))))))))
+
+(deftest battery-gru-workflow-is-observable-and-restores-best
+  (with-open [current-session (session/open {:seed 2026})]
+    (let [network (nn/build current-session
+                            [:sequential [:gru {:state-size 4 :batch-first? true}]
+                             [:last-step] [:linear 1]]
+                            {:input-shape [3 1] :name :battery-gru})
+          source (sequence-table 0.0)
+          validation (sequence-table 0.2)
+          events (ConcurrentLinkedQueue.)
+          result (nn/train! current-session :battery-gru source
+                            (assoc sequence-options :epochs 30 :optim [:adam {:lr 0.03}]
+                                   :validation validation
+                                   :early-stopping {:patience 5 :restore-best? true}
+                                   :observe #(.add events %)))
+          history (:history result)
+          observed (vec events)
+          evaluation (nn/evaluate current-session :battery-gru validation {:metrics [:mae]})]
+      (is (< (:validation-loss (last history)) (:validation-loss (first history))))
+      (is (= 7 (count (nn/predict current-session network validation {}))))
+      (is (Double/isFinite (double (:mae evaluation))))
+      (is (< (Math/abs (double (- (:loss evaluation) (get-in result [:best :loss])))) 1.0e-6))
+      (is (= (mapv #(assoc % :event :epoch :network :battery-gru) history) (pop observed)))
+      (is (= {:event :finished :stopped (:stopped result) :best (:best result)} (peek observed)))
+      (is (= [:network] (mapv :kind (:resources (session/describe current-session))))))))

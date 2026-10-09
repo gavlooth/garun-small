@@ -1,6 +1,7 @@
 (ns garun.test-runner
   "Run every Garun suite; failures set the process exit code."
   (:require [clojure.test :as test]
+            [garun.session-test]
             [garun.table-test]
             [garun.nn-test]
             [garun.metrics-test]
@@ -16,7 +17,8 @@
 (defn -main
   "Run every Garun test namespace and exit nonzero on test failures or errors."
   [& _]
-  (let [{:keys [fail error]} (test/run-tests 'garun.table-test
+  (let [{:keys [fail error]} (test/run-tests 'garun.session-test
+                                             'garun.table-test
                                              'garun.nn-test
                                              'garun.metrics-test
                                              'garun.blocks-test

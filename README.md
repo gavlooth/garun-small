@@ -7,15 +7,17 @@ A small JVM Clojure version of the Garun Hiccup DSL. It has two backends:
 - **Deep Java Library 0.36 / PyTorch 2.7.1** for tensors, neural networks,
   training and typed model inference. CPU is the default; CUDA is opt-in.
 
-The DSL names common DJL components and accepts native DJL objects for the rest.
-It does not reimplement DJL's entire Java API. Rust, classical estimators
-(k-means, SVM, XGBoost, …), visualization and session services remain out of scope.
+One `garun.session` object owns all state: the DuckDB connection, tensor memory,
+defaults and named networks, models, trainers and tables. The DSL names common
+DJL components and accepts native DJL objects for the rest; it does not
+reimplement DJL's entire Java API. Rust, classical estimators (k-means, SVM,
+XGBoost, …) and visualization remain out of scope.
 
 ## Build and test
 
 ```sh
-clojure -T:build javac   # compile the small DJL Java bridge classes
-clojure -M:test          # DuckDB, blocks, tensors, training, inference and metrics
+clojure -T:build javac   # compile the Java leaves (session core, DJL bridges)
+clojure -M:test          # sessions, DuckDB, blocks, tensors, training, inference, metrics
 ```
 
 All dependencies resolve from Maven. The default PyTorch native library comes
@@ -26,17 +28,72 @@ The `:cuda` profile instead lets DJL download/cache the pinned CUDA library.
 
 | Namespace | Surface |
 |---|---|
-| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Execution: `open`, `rows`, `columns`, `schema`, `row-count`, `matrix`, `write-csv!`, `write-parquet!` |
+| `garun.session` | `open`, `worker`, `defaults`, `register!`, `resource`, `value`, `shared`, `exclusive`, `release!`, `describe` |
+| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `row-count`, `matrix`, `materialize!`, `write-csv!`, `write-parquet!` |
 | `garun.blocks` | `compile-block`, `serializable-spec?`; Hiccup or native DJL `Block` |
-| `garun.tensor` | `manager`, `device`, `dtype`, `shape`, `array`, `ndlist`, `table-matrices`; caller-owned tensor resources |
+| `garun.tensor` | `device`, `dtype`, `shape`, `array`, `ndlist`, `table-matrices` |
 | `garun.training` | `loss`, `optimizer`, `tracker`, `initializer`, `config`; specs or native DJL components |
-| `garun.nn` | `build`, `train!`, `predict`, `predict-with`, `save!`, `load`; a `Network` implements `AutoCloseable` |
-| `garun.model` | `criteria`, `load!`, `predict`, `batch-predict`; native translators and caller-owned `ZooModel` |
+| `garun.nn` | `build`, `train!`, `trainer`, `epoch!`, `validate`, `restore-best!`, `evaluate`, `predict`, `predict-with`, `save!`, `load` |
+| `garun.model` | `criteria`, `load!`, `predict`, `batch-predict`; native translators |
 | `garun.metrics` | `accuracy mse mae r2 precision recall f1 confusion-matrix log-loss`, called as `(metric y-pred y-true)` |
 
+## Sessions
+
+```clojure
+(require '[garun.session :as session])
+
+(with-open [current-session (session/open {:database :memory :device :cpu :dtype :float32 :seed 7})]
+  ...)
+```
+
+Every resource-using function takes a **context** first: the session itself or
+a worker. Pure data (table plans, Hiccup specs, training component specs)
+never needs one. Functions accept objects; given a context they also accept the
+**keyword name** of a registered resource (`(nn/predict current-session :gru test {})`).
+
+| Owned by the session | Notes |
+|---|---|
+| DuckDB connection | `:database` is `:memory` or a file path |
+| Root tensor manager | Tensors created or returned through a context belong to it |
+| Defaults | `:device`, `:dtype`, `:engine`, `:seed`; per-call options override |
+| Registry | Networks, zoo models, trainers and materialized tables, optionally named |
+
+Closing the session closes open workers, then owned resources in reverse
+registration order, drops its private DuckDB schema, closes the tensor manager
+and finally the connection. Resources passed in with `{:owned? false}` are
+borrowed and never closed. `session/release!` closes one resource early.
+Reusing a name fails unless `{:replace? true}` is given.
+
+**Inspection:** `prn`, the REPL and `clojure.datafy/datafy` show plain data.
+
+```clojure
+(prn current-session)
+;; #garun/session {:id "…" :status :open :database ":memory" :device :cpu :dtype :float32
+;;                 :engine "PyTorch" :seed 7 :workers 0
+;;                 :resources [{:id 1 :name :batteries :kind :table :rows 3200 :columns […]}
+;;                             {:id 2 :name :gru :kind :network :spec […] :parameters 2401}]}
+```
+
+Networks print as `#garun/network {...}`, trainers as `#garun/trainer {...}`.
+
+**Threads:** use one thread per context. `(session/worker context)` returns a
+closeable worker with its own duplicated DuckDB connection and tensor
+sub-manager; it sees the session's registry and materialized tables.
+Predictions on one network may run concurrently; training takes the network's
+exclusive lock. Named tables are locked while a query reads them, so a
+release or replacement waits for running queries. The Java leaf
+(`java/garun/session/`) holds these locks and the registry; Clojure code holds no
+mutable state.
+
 **Table sources:** a column map, a vector of row maps, `[:csv {:path :header? :delimiter}]`,
-`[:parquet {:path}]`, `[:json {:path}]`, or `[:duckdb {:query "SELECT …"}]`.
-The `:duckdb` query is trusted SQL.
+`[:parquet {:path}]`, `[:json {:path}]`, `[:duckdb {:query "SELECT …"}]`, or the
+keyword name of a materialized session table. The `:duckdb` query is trusted SQL.
+
+`(table/materialize! context :name source)` runs a plan once into a table in the
+session's private schema and returns `(table/from :name)`. Later reads are
+fast and stable even for random sources, and workers see the same table.
+Pure `table/->sql` rejects plans naming session tables; `(table/->sql context plan)`
+resolves them.
 
 **Clauses:** `:select :rename :where :derive :group-by :order-by :limit :join :sample :split :honeysql`.
 `:split` must be the last clause. It returns a vector of tables that are
@@ -109,27 +166,88 @@ prepended) or `:input-shapes` (full concrete DJL shapes, including multiple
 inputs, scalars and empty tensors). They are mutually exclusive.
 `:dtype` defaults to `:float32`, `:device` to `:cpu`; `:engine` names a DJL engine.
 
-### Tabular training example
+## Training
+
+The training loop is one call. DuckDB does the data work: splits, ordering,
+windowing boundaries and standardization statistics. This is a battery
+remaining-useful-life GRU, from CSV to evaluated model:
 
 ```clojure
-(require '[garun.table :as table] '[garun.nn :as nn] '[garun.metrics :as metrics])
+(require '[garun.session :as session] '[garun.table :as table] '[garun.nn :as nn])
 
-(with-open [db (table/open)]
-  (let [base (table/query (table/from [:csv {:path "data.csv"}])
-                          [[:derive {:r [:sqrt [:+ [:* :x1 :x1] [:* :x2 :x2]]]}]
-                           [:where [:not-null :label]]])
-        [train test] (table/query base [[:split {:fractions [0.8 0.2] :seed 7 :key :id}]])
-        spec [:sequential
-              [:skip {:combine :concat} [:linear 16] [:relu]]
-              [:parallel {:combine :add} [:linear 16] [:sequential [:linear 16] [:tanh]]]
-              [:relu]
-              [:linear 1]]]
-    (with-open [net (nn/build spec {:input-shape [3] :seed 3})]
-      (nn/train! net db train {:x [:x1 :x2 :r] :y :label :loss :bce :epochs 60
-                               :batch 32 :optim [:adam {:lr 0.01}] :validation test})
-      (metrics/accuracy (nn/predict net db test {:x [:x1 :x2 :r] :output :class})
-                        (:label (table/columns db test))))))
+(with-open [current-session (session/open {:seed 2026})]
+  (let [batteries (table/materialize! current-session :batteries [:csv {:path "data/batteries.csv"}])
+        [train validation test] (table/query batteries [[:split {:fractions [0.7 0.15 0.15]
+                                                                 :seed 2026 :key :battery_id}]])]
+    (nn/build current-session [:sequential [:gru {:state-size 24 :batch-first? true}]
+                                           [:last-step]
+                                           [:linear 1]]
+              {:input-shape [30 7] :name :gru})
+    (nn/train! current-session :gru train
+               {:x [:IR :QC :QD :Tavg :Tmin :Tmax :chargetime] :y :RUL
+                :sequence {:length 30 :partition-by :battery_id :order-by :cycle}
+                :standardize [:x :y]
+                :validation validation :loss :mse :optim [:adam {:lr 0.001}]
+                :epochs 25 :batch 128
+                :early-stopping {:patience 5 :restore-best? true}
+                :observe tap>})
+    (nn/evaluate current-session :gru test {:metrics [:mae]})))
 ```
+
+| Option | Meaning |
+|---|---|
+| `:x`, `:y` | Feature and label columns |
+| `:sequence` | Full windows of `:length` rows per `:partition-by`, ordered by `:order-by`; the label is the last row's `:y`. Input is `[windows length features]` |
+| `:standardize` | `[:x]`, `[:y]` or both. Mean and population standard deviation come from **the training source only**, in one DuckDB aggregate |
+| `:validation` | Another table source, or a DJL `Dataset` for native sources |
+| `:loss`, `:optim`, `:epochs`, `:batch`, `:shuffle?`, `:seed` | As in `garun.training`; `:loss` may also be `(fn [labels predictions] NDArray)` |
+| `:early-stopping` | `{:patience n :min-delta d :restore-best? b}`; monitors validation loss, else training loss |
+| `:metrics` | `garun.metrics` keywords or `(fn [predictions truth] number)`, computed on validation every epoch in original units |
+| `:observe` | Function receiving one event map per epoch, then a `:finished` event. Exceptions abort training |
+| `:stop?` | Function of the epoch state; returning true stops training |
+| `:forward` | `(fn [trainer inputs training?] NDList)` replacing the forward pass |
+| `:config` | A native `TrainingConfig`, instead of the component options |
+
+`train!` returns plain data:
+
+```clojure
+{:history [{:epoch 1 :training-loss 0.067 :validation-loss 0.041 :best? true
+            :elapsed-milliseconds 312.0 :metrics {:mae 3.1}} …]
+ :best {:epoch 24 :loss 2.8e-5 :monitor :validation-loss}
+ :stopped :completed}   ; or :early-stopping
+```
+
+The input specification (`:x :y :sequence :standardize`) and its statistics are
+stored with the network and saved by `nn/save!`. `nn/predict` and
+`nn/evaluate` reuse them: features are scaled, outputs return in original
+units, and evaluation aligns predictions with truth itself, including
+windows. Pass `:x` (and friends) to override.
+
+**Custom loops.** `train!` is a short `reduce` over a lower layer that users can
+drive directly for schedules, curricula or their own stopping rules:
+
+```clojure
+(let [handle (nn/trainer current-session :gru train {:x features :y :RUL :validation validation})]
+  (try
+    (loop [state {}]
+      (let [state (nn/epoch! handle state)]
+        (if (my-stop? state) (nn/restore-best! handle state) (recur state))))
+    (finally (session/release! current-session handle))))
+```
+
+`epoch!` returns the next immutable state (`:epoch :history :best`);
+`validate` returns `{:loss :metrics}`. A trainer is a session resource: release
+it with `session/release!` or leave it to session close.
+
+Table and native DJL `Dataset` sources go through the same loop
+(`Trainer.iterateDataset`, gradient collector, optimizer step). Table sources
+become `ArrayDataset`s with seeded shuffling; native datasets and their arrays
+remain borrowed. Best-epoch parameters are snapshotted and restored on the
+device, not through host memory.
+
+Tabular networks without sequences use the same options without `:sequence`.
+Classification uses `:loss :bce` or `:ce` on logits; `nn/predict` with
+`:output :class` or `:probability` converts them.
 
 ## Training components
 
@@ -153,19 +271,9 @@ no learning-rate option. AdamW uses decoupled decay. Rescaling and symmetric
 gradient clipping precede other optimizers' coupled L2 decay.
 Create fresh stateful optimizers/trackers for independent training runs.
 
-The table overload `(nn/train! net db source opts)` returns
-`{:history [...]}` and requires one rank-2 float32 input/output. Feature and label
-columns are extracted together in one DuckDB query, preserving row alignment
-even for random transformations.
-
-The native overload `(nn/train! net dataset opts)` prepares a DJL `Dataset`,
-uses `EasyTrain.fit` and returns a native `TrainingResult`. Use it for images,
-sequences, multiple inputs, precise labels and non-tabular shapes.
-Options include `:epochs`, `:validation` (another Dataset), `:seed`, and either
-`:config` (native `TrainingConfig`) or training component options.
-`training/config` accepts listeners, evaluators, initializers, devices and a
-caller-owned executor. Explicit listeners replace the defaults.
-Datasets and their source arrays remain caller-owned.
+Constructors are used by `nn/train!` and `garun.training/config`, which also
+accepts listeners, evaluators, initializers, devices and a caller-owned
+executor. Explicit listeners replace the defaults.
 
 ## Tensors and device placement
 
@@ -176,24 +284,23 @@ arithmetic and training on native arrays. Use DJL's `NDArray` methods directly;
 there is no duplicate tensor-operation DSL.
 
 ```clojure
-(require '[garun.tensor :as tensor] '[garun.nn :as nn])
+(require '[garun.session :as session] '[garun.tensor :as tensor] '[garun.nn :as nn])
 
-(with-open [manager (tensor/manager {:device :cpu})
-            net (nn/build [:sequential
-                           [:conv2d {:filters 4 :kernel [3 3]}]
-                           [:global-avg-pool2d]
-                           [:linear 1]]
-                          {:input-shape [1 8 8]})]
-  (let [images (tensor/array manager (float-array (repeat 128 0.5))
-                            {:shape [2 1 8 8]})]
-    (with-open [outputs (nn/predict net images {:manager manager})]
-      (.toFloatArray (.singletonOrThrow outputs)))))
+(with-open [current-session (session/open {:device :cpu})]
+  (let [network (nn/build current-session [:sequential
+                                           [:conv2d {:filters 4 :kernel [3 3]}]
+                                           [:global-avg-pool2d]
+                                           [:linear 1]]
+                          {:input-shape [1 8 8]})
+        images (tensor/array current-session (float-array (repeat 128 0.5)) {:shape [2 1 8 8]})]
+    (.toFloatArray (.singletonOrThrow (nn/predict current-session network images {})))))
 ```
 
-Managers are caller-owned; use `with-open`. `tensor/array` and `tensor/ndlist`
-copy borrowed native inputs independently onto the destination manager's device.
-They do not steal, mutate or close inputs. Native copies/placement use device
-operations, not a GPU → host → GPU serialization path.
+`tensor/array` and `tensor/ndlist` take a context or an `NDManager` as owner.
+They copy borrowed native inputs independently onto the owner's device and
+never steal, mutate or close inputs. Native copies/placement use device
+operations, not a GPU → host → GPU path. Native `nn/predict` returns an
+`NDList` owned by the context's manager, or by `{:manager manager}` when given.
 
 Primitive arrays preserve supported dtypes. Nested Clojure integers default to
 int64 and floating numbers to float64; request `:float32` for ordinary networks.
@@ -217,16 +324,15 @@ clojure -M:cuda
 This excludes the CPU native jar and selects PyTorch 2.7.1's `cu128` library.
 DJL downloads/caches it on first use; a compatible NVIDIA driver is required.
 Start a fresh JVM when changing native profiles. Pass `:device [:gpu 0]` to
-both `tensor/manager` and `nn/build`; `:auto` lets the engine choose.
+`session/open` (or per call); `:auto` lets the engine choose.
 Explicit unavailable GPU requests fail instead of silently falling back to CPU.
 GPU execution has not been verified in this workspace: the NVIDIA driver
 cannot be contacted.
 
 ## Translators and model loading
 
-`nn/predict`'s three-argument overload requires `{:manager manager}` and returns
-an independent caller-manager-owned `NDList`, valid after predictor/network
-closure. The four-argument table overload still returns Clojure vectors.
+`nn/predict` with `:x` (or a stored input specification) predicts from a table
+and returns Clojure vectors; otherwise it predicts native tensors.
 `nn/predict-with` accepts a native DJL `Translator` and a typed input.
 
 `model/criteria` accepts a native `Criteria` or a map requiring Java
@@ -235,13 +341,15 @@ block, local path, URL, model zoo, application, group/artifact, engine, device,
 filters, arguments and progress. Native Criteria exposes more detailed DJL
 settings without more DSL machinery.
 
-`model/load!` calls DJL's real model loader and returns a caller-owned `ZooModel`.
-`model/predict` and `model/batch-predict` use its packaged translator, or accept
-an explicit translator with any DJL Model. Predictors close after each call;
-the model remains open. Direct NDArray/NDList outputs are independent detached
-copies: callers must close or attach them to their own manager. Other outputs
-retain translator-defined ownership; custom objects containing tensors must
-manage their nested tensors in `processOutput`.
+`(model/load! context criteria {:name :resnet})` calls DJL's real model loader
+and registers the `ZooModel` in the session; criteria maps without `:device`
+use the session default. `model/predict` and `model/batch-predict` use its
+packaged translator, or accept an explicit translator with any DJL Model.
+Predictors close after each call; the model stays open. Direct NDArray/NDList
+outputs of `model/predict`, `nn/predict-with` and native `nn/predict` belong to
+the context's manager and are freed when the session (or worker) closes. Other
+outputs keep translator-defined ownership; custom objects containing tensors
+must manage their nested tensors in `processOutput`.
 
 ```sh
 clojure -M:zoo          # optional DJL + PyTorch model-zoo providers
@@ -255,12 +363,13 @@ have been exercised; remote pretrained artifact downloads have not.
 
 ## Persistence
 
-`nn/save!` writes named Hiccup specs as EDN plus DJL parameters.
+`(nn/save! context network directory)` writes named Hiccup specs as EDN plus DJL
+parameters and the stored input specification.
 Native blocks, factories, functions and constant embedding tensors require an
 explicit `{:spec reconstruction-spec}`. A non-EDN reconstruction spec is not
 serialized: `nn/load` then requires `:spec` from the caller.
 Missing reconstruction information fails before writing files.
 
-Load options can override `:spec`, `:device`, `:dtype` and `:engine`.
-For example, `(nn/load directory {:device :cpu})` restores a GPU save on CPU.
-Models, managers and native output resources must be closed by their owner.
+`(nn/load context directory {:name :gru})` registers the restored network.
+Options can override `:spec`, `:device`, `:dtype` and `:engine`; for example
+`{:device :cpu}` restores a GPU save on CPU.
