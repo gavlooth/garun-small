@@ -1,4 +1,5 @@
 {:lint-as {garun.ndarray/def-unary clojure.core/def
            garun.ndarray/def-binary clojure.core/def
            garun.ndarray/def-reduction clojure.core/def
-           garun.ndarray/def-index-reduction clojure.core/def}}
+           garun.ndarray/def-index-reduction clojure.core/def
+           garun.ndarray/def-creation clojure.core/def}}

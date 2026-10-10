@@ -2,13 +2,16 @@
   (:require [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [garun.blocks :as blocks]
+            [garun.context :as context]
             [garun.ndarray :as nd]
             [garun.session :as session]
             [garun.tensor :as tensor])
-  (:import [ai.djl.ndarray NDArray NDList]
+  (:import [ai.djl Device]
+           [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.index NDIndex]
            [ai.djl.ndarray.types DataType]
            [ai.djl.nn Block]
+           [ai.djl.training GradientCollector]
            [java.io StringWriter]))
 
 (set! *warn-on-reflection* true)
@@ -194,13 +197,208 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not implemented"
                             (nd/to-type array :int16))))))
 
+(deftest creation-uses-context-or-manager-ownership-and-dtype-options
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})
+              ^NDManager child (.newSubManager (context/manager current-session))]
+    (is (= "PyTorch" (.getEngineName (.getEngine child))))
+    (doseq [owner [current-session child]
+            [operation options expected dtype]
+            [[nd/zeros {:dtype :int32} [0 0 0 0 0 0] DataType/INT32]
+             [nd/ones {:dtype :float64} [1 1 1 1 1 1] DataType/FLOAT64]
+             [nd/full {:value 7 :dtype :int64} [7 7 7 7 7 7] DataType/INT64]
+             [nd/arange {} [0 1 2 3 4 5] DataType/INT32]
+             [nd/random-normal {:mean 7 :standard-deviation 0 :dtype :float64}
+              [7 7 7 7 7 7] DataType/FLOAT64]
+             [nd/random-uniform {:low 7 :high 7 :dtype :float32}
+              [7 7 7 7 7 7] DataType/FLOAT32]]]
+      (let [^NDArray result (operation owner [2 3] options)]
+        (is (= [2 3] (nd/shape result)))
+        (is (near-vector? expected (nd/to-vector result)))
+        (is (= dtype (.getDataType result)))
+        (is (= (Device/cpu) (.getDevice result)))
+        (is (identical? (if (identical? owner child) child (context/manager current-session))
+                        (.getManager result)))))
+    (doseq [[operation expected] [[nd/zeros [0 0]] [nd/ones [1 1]] [nd/full [0 0]]]]
+      (let [^NDArray result (operation current-session [2])]
+        (is (= DataType/FLOAT32 (.getDataType result)))
+        (is (near-vector? expected (nd/to-vector result)))))
+    (is (= [3 5 7 9] (nd/to-vector (nd/arange child [2 2] {:start 3 :step 2 :dtype :int64}))))
+    (is (near-vector? [1.5 1.0 0.5 0.0]
+                      (nd/to-vector (nd/arange child [2 2]
+                                               {:start 1.5 :step -0.5 :dtype :float32}))))
+    (is (= [] (nd/shape (nd/zeros child []))))
+    (is (= [0.0] (nd/to-vector (nd/zeros child []))))
+    (is (= [0 2] (nd/shape (nd/arange child [0 2]))))
+    (is (= [] (nd/to-vector (nd/arange child [0 2]))))
+    (let [normal (nd/to-vector (nd/random-normal child [32]))
+          uniform (nd/to-vector (nd/random-uniform current-session [32] {:low -2 :high 3}))]
+      (is (= 32 (count normal) (count uniform)))
+      (is (every? #(Double/isFinite (double %)) normal))
+      (is (< 1 (count (distinct normal))))
+      (is (every? #(and (<= -2 %) (< % 3)) uniform))
+      (is (< 1 (count (distinct uniform)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not implemented"
+                          (nd/zeros child [2] {:dtype :int16})))))
+
+(deftest like-creation-retains-native-shape-dtype-device-and-input
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+    (let [^NDArray array (tensor/array current-session [[1 2] [3 4]] {:dtype :int64})]
+      (doseq [[result expected] [[(nd/zeros-like array) [0 0 0 0]]
+                                 [(nd/ones-like array) [1 1 1 1]]
+                                 [(nd/full-like array 7) [7 7 7 7]]]]
+        (is (= expected (nd/to-vector result)))
+        (is (= [2 2] (nd/shape result)))
+        (is (= DataType/INT64 (.getDataType ^NDArray result)))
+        (is (= (.getDevice array) (.getDevice ^NDArray result)))
+        (is (identical? (.getManager array) (.getManager ^NDArray result)))
+        (is (not (identical? array result))))
+      (is (= [1 2 3 4] (nd/to-vector array))))))
+
+(deftest selection-and-logical-masks-check-native-values
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})
+              ^NDManager mask-manager (.newSubManager (context/manager current-session))]
+    (let [array (tensor/array current-session [[1 3 2] [6 4 5]] {:dtype :float32})
+          condition (tensor/array mask-manager [[true false true] [false true false]])
+          suffix-mask (tensor/array current-session [true false true])
+          indices (tensor/array current-session [[2 0] [1 2]])
+          classes (tensor/array current-session [0 2])
+          nonfinite (tensor/array current-session [Double/NaN Double/POSITIVE_INFINITY
+                                                   Double/NEGATIVE_INFINITY 1]
+                                  {:dtype :float32})
+          ^NDArray selected (nd/where condition array (nd/neg array))]
+      (is (= [2.0 3.0 2.0 5.0 4.0 5.0] (nd/to-vector (nd/clip array 2 5))))
+      (is (= [1.0 -3.0 2.0 -6.0 4.0 -5.0] (nd/to-vector selected)))
+      (is (identical? (context/manager current-session) (.getManager selected)))
+      (is (= (Device/cpu) (.getDevice selected)))
+      (is (= [1.0 2.0 4.0] (nd/to-vector (nd/boolean-mask array condition))))
+      (is (= [3] (nd/shape (nd/boolean-mask array condition))))
+      (is (= [1.0 2.0 6.0 5.0] (nd/to-vector (nd/boolean-mask array suffix-mask 1))))
+      (is (= [2 2] (nd/shape (nd/boolean-mask array suffix-mask 1))))
+      (is (= [2.0 1.0 4.0 5.0] (nd/to-vector (nd/gather array indices 1))))
+      (is (= [2 2] (nd/shape (nd/gather array indices 1))))
+      (doseq [encoded [(nd/one-hot classes 3) (nd/one-hot classes 3 :int32)]]
+        (is (= [2 3] (nd/shape encoded)))
+        (is (near-vector? [1 0 0 0 0 1] (nd/to-vector encoded))))
+      (is (= DataType/INT32 (.getDataType (nd/one-hot classes 3 :int32))))
+      (is (= [0 1 0 1 0 1] (nd/to-vector (nd/logical-not condition))))
+      (is (= [0 0 0 0 0 0]
+             (nd/to-vector (nd/logical-and condition (nd/logical-not condition)))))
+      (is (= [1 1 1 1 1 1]
+             (nd/to-vector (nd/logical-or condition (nd/logical-not condition)))))
+      (is (= [1 0 0 0] (nd/to-vector (nd/is-nan nonfinite))))
+      (is (= [0 1 1 0] (nd/to-vector (nd/is-infinite nonfinite))))
+      (is (= [1.0 3.0 2.0 6.0 4.0 5.0] (nd/to-vector array))))))
+
+(deftest ordering-cumulative-sums-and-flips-check-values
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+    (let [^NDArray array (tensor/array current-session [[1 3 2] [6 4 5]] {:dtype :float32})]
+      (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (nd/to-vector (nd/sort array))))
+      (is (= [1.0 3.0 2.0 6.0 4.0 5.0] (nd/to-vector (nd/sort array 0))))
+      (is (= [0 2 1 1 2 0] (nd/to-vector (nd/arg-sort array))))
+      (is (= [0 0 0 1 1 1] (nd/to-vector (nd/arg-sort array 0))))
+      (is (= [1 2 0 0 2 1] (nd/to-vector (nd/arg-sort array 1 false))))
+      (let [^NDList largest (nd/top-k array 2 1)
+            ^NDList smallest (nd/top-k array 1 1 false true)
+            ^NDList unsorted (nd/top-k array 2 1 true false)]
+        (is (= [[3.0 2.0 6.0 5.0] [1 2 0 2]] (mapv nd/to-vector largest)))
+        (is (= [[1.0 4.0] [0 1]] (mapv nd/to-vector smallest)))
+        (is (= [[2.0 3.0] [5.0 6.0]]
+               (mapv #(vec (clojure.core/sort %))
+                     (partition 2 (nd/to-vector (nd/head unsorted))))))
+        (is (= [2 2] (nd/shape (nd/head largest))))
+        (is (every? #(identical? (.getManager array) (.getManager ^NDArray %)) largest)))
+      (is (= [1.0 3.0 2.0 7.0 7.0 7.0] (nd/to-vector (nd/cum-sum array))))
+      (is (= [1.0 4.0 6.0 6.0 10.0 15.0] (nd/to-vector (nd/cum-sum array 1))))
+      (is (= [2.0 3.0 1.0 5.0 4.0 6.0] (nd/to-vector (nd/flip array 1))))
+      (is (= [5.0 4.0 6.0 2.0 3.0 1.0] (nd/to-vector (nd/flip array [0 1]))))
+      (is (= [6.0 4.0 5.0 1.0 3.0 2.0] (nd/to-vector (nd/flip array (int-array [0])))))
+      (is (= [1.0 3.0 2.0 6.0 4.0 5.0] (nd/to-vector array))))))
+
+(deftest additional-math-norms-and-batching-check-values
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+    (let [positive (tensor/array current-session [1 10 100] {:dtype :float32})
+          powers (tensor/array current-session [1 2 8] {:dtype :float32})
+          angles (tensor/array current-session [0 1] {:dtype :float32})
+          other-angles (tensor/array current-session [1 1] {:dtype :float32})
+          array (tensor/array current-session [[3 4] [0 5]] {:dtype :float32})
+          batch (tensor/array current-session [[[1 2] [3 4]] [[2 0] [0 2]]] {:dtype :float32})
+          column (tensor/array current-session [[1] [2]] {:dtype :float32})]
+      (is (near-vector? [0 1 2] (nd/to-vector (nd/log10 positive))))
+      (is (near-vector? [0 1 3] (nd/to-vector (nd/log2 powers))))
+      (is (near-vector? [0 0.8427007929497149] (nd/to-vector (nd/erf angles))))
+      (is (near-vector? [0 (/ Math/PI 4)] (nd/to-vector (nd/atan2 angles other-angles))))
+      (is (near-vector? [(Math/sqrt 50)] (nd/to-vector (nd/norm array))))
+      (is (near-vector? [5 5] (nd/to-vector (nd/norm array [1]))))
+      (is (= [2 1] (nd/shape (nd/norm array (int-array [1]) true))))
+      (is (near-vector? [5 5] (nd/to-vector (nd/norm array (int-array [1]) true))))
+      (is (= [1 1] (nd/shape (nd/norm array nil true))))
+      (is (near-vector? [(Math/sqrt 50)] (nd/to-vector (nd/norm array nil true))))
+      (is (near-vector? [7 5] (nd/to-vector (nd/norm array 1 [1] false))))
+      (is (near-vector? [12] (nd/to-vector (nd/norm array 1 nil false))))
+      (is (= [2 2 2] (nd/shape (nd/batch-matmul batch batch))))
+      (is (= [7.0 10.0 15.0 22.0 4.0 0.0 0.0 4.0]
+             (nd/to-vector (nd/batch-matmul batch batch))))
+      (is (= [2 3] (nd/shape (nd/broadcast column [2 3]))))
+      (is (= [1.0 1.0 1.0 2.0 2.0 2.0] (nd/to-vector (nd/broadcast column [2 3])))))))
+
+(deftest repeating-elements-and-tiling-blocks-remain-distinct
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+    (let [array (tensor/array current-session [[1 2] [3 4]])
+          row (tensor/array current-session [1 2])]
+      (is (= [1 1 2 2] (nd/to-vector (nd/repeat row 2))))
+      (is (= [1 2 1 2] (nd/to-vector (nd/tile row 2))))
+      (doseq [counts [[1 2] (long-array [1 2])]]
+        (is (= [1 1 2 2 3 3 4 4] (nd/to-vector (nd/repeat array counts))))
+        (is (= [1 2 1 2 3 4 3 4] (nd/to-vector (nd/tile array counts)))))
+      (is (= [1 1 2 2 3 3 4 4] (nd/to-vector (nd/repeat array 1 2))))
+      (is (= [4 4] (nd/shape (nd/repeat array 2))))
+      (is (= [1 1 2 2 1 1 2 2 3 3 4 4 3 3 4 4] (nd/to-vector (nd/repeat array 2))))
+      (is (= [4 4] (nd/shape (nd/tile array 2))))
+      (is (= [1 2 1 2 3 4 3 4 1 2 1 2 3 4 3 4] (nd/to-vector (nd/tile array 2))))
+      (is (= [1 2 3 4] (nd/to-vector array))))))
+
+(deftest gradient-control-and-device-copies-retain-native-values
+  (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+    (let [^NDArray array (tensor/array current-session [2 3] {:dtype :float32})
+          ^NDArray tracking (nd/requires-gradient! array true)
+          ^NDArray detached (nd/stop-gradient array)
+          ^NDArray copied (nd/to-device array :cpu true)]
+      (is (identical? array tracking))
+      (is (.hasGradient array))
+      (is (= [2.0 3.0] (nd/to-vector tracking) (nd/to-vector detached) (nd/to-vector copied)))
+      (is (not (.hasGradient detached)))
+      (is (not (identical? array detached)))
+      (is (identical? array (nd/to-device array :cpu)))
+      (is (identical? array (nd/to-device array (Device/cpu))))
+      (is (not (identical? array copied)))
+      (is (= (Device/cpu) (.getDevice copied)))
+      (is (identical? (.getManager array) (.getManager copied)))
+      (is (identical? (.getManager array) (.getManager detached)))
+      (with-open [^GradientCollector collector (.newGradientCollector (.getEngine (.getManager array)))]
+        (let [objective (nd/sum (nd/add (nd/square array) (nd/mul detached 10)))]
+          (is (= [63.0] (nd/to-vector objective)))
+          (.backward collector objective)))
+      (let [^NDArray result (nd/gradient array)]
+        (is (= [4.0 6.0] (nd/to-vector result)))
+        (is (identical? (.getManager array) (.getManager result))))
+      (is (identical? array (nd/requires-gradient! array false)))
+      (is (not (.hasGradient array)))
+      (is (= [2.0 3.0] (nd/to-vector array))))))
+
 (deftest generated-wrappers-name-the-djl-method-in-their-docstrings
   (doseq [[function method] [[#'nd/neg "neg"] [#'nd/abs "abs"] [#'nd/square "square"]
                              [#'nd/sqrt "sqrt"] [#'nd/exp "exp"] [#'nd/log "log"]
                              [#'nd/sin "sin"] [#'nd/cos "cos"] [#'nd/tanh "tanh"]
                              [#'nd/sign "sign"] [#'nd/floor "floor"] [#'nd/ceil "ceil"]
                              [#'nd/round "round"] [#'nd/flatten "flatten"] [#'nd/duplicate "duplicate"]
-                             [#'nd/add "add"] [#'nd/sum "sum"] [#'nd/argmax "argMax"]]]
+                             [#'nd/add "add"] [#'nd/sum "sum"] [#'nd/argmax "argMax"]
+                             [#'nd/zeros-like "zerosLike"] [#'nd/ones-like "onesLike"]
+                             [#'nd/log10 "log10"] [#'nd/log2 "log2"] [#'nd/erf "erf"]
+                             [#'nd/logical-and "logicalAnd"] [#'nd/logical-or "logicalOr"]
+                             [#'nd/logical-not "logicalNot"] [#'nd/is-nan "isNaN"]
+                             [#'nd/is-infinite "isInfinite"] [#'nd/atan2 "atan2"]
+                             [#'nd/batch-matmul "batchMatMul"] [#'nd/stop-gradient "stopGradient"]
+                             [#'nd/gradient "getGradient"]]]
     (is (string/includes? (:doc (meta function)) (str "NDArray." method "(")))))
 
 (deftest unhinted-lambda-blocks-compile-without-reflection-warnings
@@ -215,9 +413,22 @@
                             *warn-on-reflection* true
                             *err* errors]
                     (eval '(fn [array other]
-                             (.toFloatArray (nd/square (nd/add array other))))))]
+                             (.toFloatArray (nd/square (nd/add array other))))))
+        new-operations (binding [*ns* (the-ns 'garun.ndarray-test)
+                                 *warn-on-reflection* true
+                                 *err* errors]
+                         (eval '(fn [owner array]
+                                  [(vec (.toFloatArray (nd/log10 (nd/clip array 1 100))))
+                                   (.size (nd/top-k array 1 0))
+                                   (.getDataType (nd/zeros owner [2]))
+                                   (.getDevice (nd/to-device (nd/sort array) :cpu))])))]
     (is (instance? Block block))
     (is (not (string/includes? (str errors) "Reflection warning")) (str errors))
-    (with-open [current-session (session/open)]
-      (is (= [9.0 16.0]
-             (vec (operation (tensor/array current-session [1 2] {:dtype :float32}) 2)))))))
+    (with-open [current-session (session/open {:engine "PyTorch" :device :cpu})]
+      (let [array (tensor/array current-session [1 2] {:dtype :float32})
+            [logs count dtype device] (new-operations current-session array)]
+        (is (= [9.0 16.0] (vec (operation array 2))))
+        (is (near-vector? [0 (Math/log10 2)] logs))
+        (is (= 2 count))
+        (is (= DataType/FLOAT32 dtype))
+        (is (= (Device/cpu) device))))))

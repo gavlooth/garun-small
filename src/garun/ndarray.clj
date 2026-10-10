@@ -1,15 +1,18 @@
 (ns garun.ndarray
   "Reflection-free functions over DJL NDArray and NDList values.
 
-  get, abs, max, min, concat and flatten shadow clojure.core names and are
-  excluded from this namespace's core referrals. Use the nd alias at callsites.
+  get, abs, max, min, concat, flatten, sort and repeat shadow clojure.core
+  names and are excluded from this namespace's core referrals. Use the nd alias.
   Operations retain DJL's dtype, broadcasting, gradient and manager semantics;
   they do not copy or transfer inputs unless the named DJL operation does.
   ndlist borrows its arrays: closing that NDList also closes its elements."
-  (:refer-clojure :exclude [get abs max min concat flatten])
-  (:require [garun.tensor :as tensor])
-  (:import [ai.djl.ndarray NDArray NDArrays NDList]
+  (:refer-clojure :exclude [get abs max min concat flatten sort repeat])
+  (:require [garun.context :as context]
+            [garun.tensor :as tensor])
+  (:import [ai.djl.ndarray NDArray NDArrays NDList NDManager]
            [ai.djl.ndarray.index NDIndex]
+           [ai.djl.ndarray.types Shape]
+           [garun.context Context]
            [java.util Collection]))
 
 (set! *warn-on-reflection* true)
@@ -24,10 +27,10 @@
   ^ints [axes]
   (if (instance? int-array-class axes) axes (int-array axes)))
 
-(defmacro ^:private def-unary [function method]
+(defmacro ^:private def-unary [function method & [documentation]]
   (let [array (with-meta 'array {:tag 'ai.djl.ndarray.NDArray})]
     `(defn ~(with-meta function {:tag 'ai.djl.ndarray.NDArray})
-       ~(str "Call DJL NDArray." method "().")
+       ~(or documentation (str "Call DJL NDArray." method "()."))
        [~array]
        (. ~array ~(symbol method)))))
 
@@ -61,15 +64,46 @@
 
 (def-unary duplicate "duplicate")
 
-(defmacro ^:private def-binary [function method]
+(def-unary zeros-like "zerosLike"
+  "Call DJL NDArray.zerosLike(), preserving shape, dtype and device.
+  Owned by the input manager, or its device-specific child if devices differ.")
+
+(def-unary ones-like "onesLike"
+  "Call DJL NDArray.onesLike(), preserving shape, dtype and device.
+  Owned by the input manager, or its device-specific child if devices differ.")
+
+(def-unary log10 "log10")
+
+(def-unary log2 "log2")
+
+(def-unary erf "erf")
+
+(def-unary logical-not "logicalNot")
+
+(def-unary is-nan "isNaN")
+
+(def-unary is-infinite "isInfinite")
+
+(def-unary stop-gradient "stopGradient"
+  "Call DJL NDArray.stopGradient(), returning a detached array on the same manager/device.
+  PyTorch shares its storage with the input, but stops tracking its gradients.")
+
+(def-unary gradient "getGradient"
+  "Call DJL NDArray.getGradient() on an array with gradient tracking enabled.
+  The native gradient belongs to the input manager; it is not an independent copy.")
+
+(defmacro ^:private def-binary [function method & [array-only?]]
   (let [array (with-meta 'array {:tag 'ai.djl.ndarray.NDArray})
-        other 'other]
+        other (cond-> 'other array-only? (with-meta {:tag 'ai.djl.ndarray.NDArray}))]
     `(defn ~(with-meta function {:tag 'ai.djl.ndarray.NDArray})
-       ~(str "Call DJL NDArray." method "(NDArray) or " method "(Number), preserving broadcasting.")
+       ~(str "Call DJL NDArray." method "(NDArray)"
+             (if array-only? "." (str " or " method "(Number), preserving broadcasting.")))
        [~array ~other]
-       (if (instance? NDArray ~other)
-         (. ~array ~(symbol method) ~(with-meta other {:tag 'ai.djl.ndarray.NDArray}))
-         (. ~array ~(symbol method) ~(with-meta other {:tag 'java.lang.Number}))))))
+       ~(if array-only?
+          `(. ~array ~(symbol method) ~other)
+          `(if (instance? NDArray ~other)
+             (. ~array ~(symbol method) ~(with-meta other {:tag 'ai.djl.ndarray.NDArray}))
+             (. ~array ~(symbol method) ~(with-meta other {:tag 'java.lang.Number})))))))
 
 (def-binary add "add")
 
@@ -95,6 +129,14 @@
 
 (def-binary lte "lte")
 
+(def-binary logical-and "logicalAnd" :array-only)
+
+(def-binary logical-or "logicalOr" :array-only)
+
+(def-binary atan2 "atan2" :array-only)
+
+(def-binary batch-matmul "batchMatMul" :array-only)
+
 (defmacro ^:private def-reduction [function method]
   (let [array (with-meta 'array {:tag 'ai.djl.ndarray.NDArray})
         axes 'axes
@@ -114,7 +156,7 @@
           ;; element and restore size-one dimensions when requested.
           (let [^NDArray result# (. ~array ~(symbol method))]
             (if ~keep-dims?
-              (.reshape result# (long-array (repeat (.dimension (.getShape ~array)) 1)))
+              (.reshape result# (long-array (clojure.core/repeat (.dimension (.getShape ~array)) 1)))
               result#))
           (. ~array ~(symbol method) (primitive-axes ~axes) (boolean ~keep-dims?)))))))
 
@@ -154,7 +196,7 @@
                                  (. ~array ~(symbol method) (int axis#)))]
           (cond
             (not ~keep-dims?) result#
-            (nil? axis#) (.reshape result# (long-array (repeat (.dimension (.getShape ~array)) 1)))
+            (nil? axis#) (.reshape result# (long-array (clojure.core/repeat (.dimension (.getShape ~array)) 1)))
             :else (.expandDims result# (int axis#))))))))
 
 (def-index-reduction argmax "argMax")
@@ -255,6 +297,187 @@
   (^NDArray [^NDArray array dtype] (to-type array dtype false))
   (^NDArray [^NDArray array dtype copy?]
    (.toType array (tensor/dtype dtype (.getEngine (.getManager array))) (boolean copy?))))
+
+(defn full-like
+  "Call the input's NDManager.full(Shape, float, DataType, Device), preserving shape/dtype/device.
+  DJL has no NDArray.fullLike method. The fill value is coerced to DJL's float argument.
+  Owned by the input manager, or its device-specific child if devices differ."
+  ^NDArray [^NDArray array value]
+  (.full (.getManager array) (.getShape array) (float value) (.getDataType array) (.getDevice array)))
+
+(defn- manager-create
+  ^NDArray [^NDManager manager operation dimensions options]
+  (let [^Shape dimensions (tensor/shape dimensions)
+        dtype (tensor/dtype (:dtype options (if (= :arange operation) :int32 :float32))
+                            (.getEngine manager))]
+    (case operation
+      :zeros (.zeros manager dimensions dtype)
+      :ones (.ones manager dimensions dtype)
+      :full (.full manager dimensions (float (:value options 0)) dtype)
+      :random-normal (.randomNormal manager (float (:mean options 0))
+                                    (float (:standard-deviation options 1)) dimensions dtype)
+      :random-uniform (.randomUniform manager (float (:low options 0))
+                                      (float (:high options 1)) dimensions dtype)
+      :arange (let [start (:start options 0)
+                    step (:step options 1)
+                    end (+ start (* step (.size dimensions)))]
+                (with-open [^NDArray flat (if (and (integer? start) (integer? step))
+                                            (.arange manager (int start) (int end) (int step) dtype)
+                                            (.arange manager (float start) (float end) (float step) dtype))]
+                  (.reshape flat dimensions))))))
+
+(defmacro ^:private def-creation [function method documentation]
+  (let [owner (with-meta 'owner {:tag 'Object})
+        dimensions 'dimensions
+        options 'options]
+    `(defn ~(with-meta function {:tag 'ai.djl.ndarray.NDArray})
+       ~(str "Call DJL NDManager." method ", owned by the given NDManager or Context's manager.\n"
+             "  The result uses that manager's device; dimensions is a shape vector.\n"
+             "  :dtype is resolved by tensor/dtype against the owner's engine.\n"
+             "  " documentation)
+       ([~owner ~dimensions] (~function ~owner ~dimensions {}))
+       ([~owner ~dimensions ~options]
+        (if (instance? Context ~owner)
+          (context/call ~owner #(manager-create (context/manager ~owner)
+                                                ~(keyword function) ~dimensions ~options))
+          (manager-create ~owner ~(keyword function) ~dimensions ~options))))))
+
+(def-creation zeros "zeros(Shape, DataType)" "Options: :dtype (default :float32).")
+
+(def-creation ones "ones(Shape, DataType)" "Options: :dtype (default :float32).")
+
+(def-creation full "full(Shape, float, DataType)"
+  "Options: :value (default 0, coerced to float), :dtype (default :float32).")
+
+(def-creation arange "arange(int/float, int/float, int/float, DataType)"
+  "Fill the shape in row-major order from :start (default 0) by :step (default 1).
+  The exclusive end is start + step * element-count; :dtype defaults to :int32.
+  Integral start/step use DJL's int endpoints; otherwise endpoints are floats.")
+
+(def-creation random-normal "randomNormal(float, float, Shape, DataType)"
+  "Options: :mean (default 0), :standard-deviation (default 1), :dtype (default :float32).
+  Random distributions require a backend-supported floating dtype.")
+
+(def-creation random-uniform "randomUniform(float, float, Shape, DataType)"
+  "Options: :low (default 0, inclusive), :high (default 1, exclusive), :dtype (default :float32).
+  Random distributions require a backend-supported floating dtype.")
+
+(defn clip
+  "Call DJL NDArray.clip(Number, Number), without modifying the input."
+  ^NDArray [^NDArray array ^Number lower ^Number upper]
+  (.clip array lower upper))
+
+(defn where
+  "Call DJL NDArrays.where(condition, when-true, when-false).
+  PyTorch requires condition and when-true to have the same shape.
+  The result belongs to when-true's manager/device, not the condition's."
+  ^NDArray [^NDArray condition ^NDArray when-true ^NDArray when-false]
+  (NDArrays/where condition when-true when-false))
+
+(defn boolean-mask
+  "Call DJL NDArray.booleanMask(NDArray[, int]); axis defaults to 0.
+  PyTorch supports a same-shape mask (flat selection) or a mask matching the
+  trailing dimensions starting at axis. A leading row-only mask is unsupported."
+  (^NDArray [^NDArray array ^NDArray mask] (.booleanMask array mask))
+  (^NDArray [^NDArray array ^NDArray mask axis] (.booleanMask array mask (int axis))))
+
+(defn gather
+  "Call DJL NDArray.gather(NDArray, int) with integer indices and an axis."
+  ^NDArray [^NDArray array ^NDArray indices axis]
+  (.gather array indices (int axis)))
+
+(defn one-hot
+  "Call DJL NDArray.oneHot(int[, DataType]); dtype defaults to :float32.
+  Integer input indices become a trailing depth dimension of 0/1 values.
+  Custom on/off values are not implemented by the pinned PyTorch engine."
+  (^NDArray [^NDArray array depth] (.oneHot array (int depth)))
+  (^NDArray [^NDArray array depth dtype]
+   (.oneHot array (int depth) (tensor/dtype dtype (.getEngine (.getManager array))))))
+
+(defn sort
+  "Call DJL NDArray.sort() or sort(int), ascending along the last or given axis."
+  (^NDArray [^NDArray array] (.sort array))
+  (^NDArray [^NDArray array axis] (.sort array (int axis))))
+
+(defn arg-sort
+  "Call DJL NDArray.argSort(), argSort(int), or argSort(int, boolean).
+  Defaults to the last axis, ascending; false selects descending indices."
+  (^NDArray [^NDArray array] (.argSort array))
+  (^NDArray [^NDArray array axis] (.argSort array (int axis)))
+  (^NDArray [^NDArray array axis ascending?] (.argSort array (int axis) (boolean ascending?))))
+
+(defn top-k
+  "Call DJL NDArray.topK(int, int[, boolean, boolean]).
+  Returns an NDList [values indices] owned by the input manager/device.
+  largest? and sorted? default to true; closing the list closes its result arrays."
+  (^NDList [^NDArray array k axis] (.topK array (int k) (int axis)))
+  (^NDList [^NDArray array k axis largest? sorted?]
+   (.topK array (int k) (int axis) (boolean largest?) (boolean sorted?))))
+
+(defn cum-sum
+  "Call DJL NDArray.cumSum() or cumSum(int); PyTorch's default axis is 0."
+  (^NDArray [^NDArray array] (.cumSum array))
+  (^NDArray [^NDArray array axis] (.cumSum array (int axis))))
+
+(defn flip
+  "Call DJL NDArray.flip(int[]) with an axis integer or axes vector/int-array."
+  ^NDArray [^NDArray array axes]
+  (.flip array (if (integer? axes) (int-array [axes]) (primitive-axes axes))))
+
+(defn norm
+  "Call DJL NDArray.norm(), norm(int[][, boolean]), or norm(int, int[], boolean).
+  Default order is 2; omitted/nil axes reduces all dimensions.
+  Axes are a vector/int-array; keep-dims? defaults to false."
+  (^NDArray [^NDArray array] (.norm array))
+  (^NDArray [^NDArray array axes] (norm array axes false))
+  (^NDArray [^NDArray array axes keep-dims?]
+   (if (nil? axes)
+     (.norm array (boolean keep-dims?))
+     (.norm array (primitive-axes axes) (boolean keep-dims?))))
+  (^NDArray [^NDArray array order axes keep-dims?]
+   (.norm array (int order) (primitive-axes (or axes [])) (boolean keep-dims?))))
+
+(defn broadcast
+  "Call DJL NDArray.broadcast(Shape) with a target shape vector."
+  ^NDArray [^NDArray array dimensions]
+  (.broadcast array (tensor/shape dimensions)))
+
+(defn repeat
+  "Call DJL NDArray.repeat(long), repeat(long[]), or repeat(int, long).
+  A scalar count repeats elements on every axis; a vector/long-array supplies
+  counts per axis. The three-argument form is (repeat array axis count)."
+  (^NDArray [^NDArray array counts]
+   (cond
+     (integer? counts) (.repeat array (long counts))
+     (instance? long-array-class counts) (.repeat array ^longs counts)
+     :else (.repeat array (long-array counts))))
+  (^NDArray [^NDArray array axis count] (.repeat array (int axis) (long count))))
+
+(defn tile
+  "Call DJL NDArray.tile(long) or tile(long[]) to tile whole dimensions.
+  A scalar count tiles every axis; a vector/long-array supplies counts per axis.
+  PyTorch's tile(int, long) and tile(Shape) overloads are not implemented."
+  ^NDArray [^NDArray array counts]
+  (cond
+    (integer? counts) (.tile array (long counts))
+    (instance? long-array-class counts) (.tile array ^longs counts)
+    :else (.tile array (long-array counts))))
+
+(defn requires-gradient!
+  "Call DJL NDArray.setRequiresGradient(boolean) and return the original array.
+  Only changes gradient tracking; it does not mutate tensor values."
+  ^NDArray [^NDArray array requires-gradient?]
+  (.setRequiresGradient array (boolean requires-gradient?))
+  array)
+
+(defn to-device
+  "Call DJL NDArray.toDevice(Device, boolean), resolving specs through tensor/device.
+  copy? defaults to false; a matching device may return the original array.
+  The result uses the requested device. PyTorch keeps the input manager when its
+  device matches, otherwise the result belongs to a device-specific child manager."
+  (^NDArray [^NDArray array device] (to-device array device false))
+  (^NDArray [^NDArray array device copy?]
+   (.toDevice array (tensor/device device (.getEngine (.getManager array))) (boolean copy?))))
 
 (defn to-vector
   "Return flat host numbers using DJL's dtype-specific to*Array method, preserving int64.

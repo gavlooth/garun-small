@@ -302,6 +302,60 @@ reflective method calls:
                              (nd/singleton labels)))))
 ```
 
+The CPU-tested wrapper groups are:
+
+| Group | Functions |
+|---|---|
+| Creation | `zeros-like`, `ones-like`, `full-like`; owner-based `zeros`, `ones`, `full`, `arange`, `random-normal`, `random-uniform` |
+| Selection and masking | `clip`, `where`, `boolean-mask`, `gather`, `one-hot`, `logical-and`, `logical-or`, `logical-not`, `is-nan`, `is-infinite` |
+| Ordering | `sort`, `arg-sort`, `top-k`, `cum-sum`, `flip` |
+| Additional math | `log10`, `log2`, `erf`, `atan2`, `norm`, `batch-matmul`, `broadcast`, `repeat`, `tile` |
+| Gradients and devices | `stop-gradient`, `gradient`, `requires-gradient!`, `to-device` |
+
+Owner-based creation takes `(owner dimensions options)`, where the owner is
+an `NDManager` or a `garun.context/Context` (session or worker), dimensions is a
+shape vector, and options defaults to `{}`. Results belong to that manager on
+its device. `:dtype` uses `tensor/dtype`; the default is `:float32`, except
+`:int32` for `arange`. `full` accepts `:value` (default 0). `arange` fills the
+shape in row-major order from `:start` (default 0) by `:step` (default 1),
+using DJL's int endpoints for integers or float endpoints otherwise.
+`random-normal` accepts `:mean` and `:standard-deviation` (defaults 0 and 1);
+`random-uniform` accepts inclusive `:low` and exclusive `:high` (defaults 0
+and 1). Random distributions require backend-supported floating dtypes.
+`full-like` uses the input's manager because DJL 0.36 has no `NDArray.fullLike`.
+Fill values pass through DJL's float argument. Like-creation preserves shape,
+dtype and device; a device unlike the input manager's uses its device-specific
+child manager.
+
+`where` takes three arrays `(condition when-true when-false)` and belongs to
+`when-true`'s manager/device. PyTorch requires condition and `when-true` to have
+the same shape. `boolean-mask` supports a same-shape mask (flat selection) or
+a mask matching trailing dimensions beginning at its optional axis; a leading
+row-only mask is unsupported. `gather` requires integer indices and an axis.
+`one-hot` takes depth and an optional dtype, using 0/1 values; custom on/off
+values are not implemented by this engine.
+
+`sort` and `arg-sort` default to the last axis; `arg-sort` also accepts an
+ascending boolean. `top-k` returns an `NDList` containing `[values indices]`,
+owned by the input manager; closing it closes those two result arrays.
+Its arguments are `(array k axis)` or `(array k axis largest? sorted?)`,
+with both flags defaulting to true. `cum-sum` defaults to axis 0.
+`flip` accepts an axis or axis vector, and `norm` accepts axes, `keep-dims?`,
+and optionally an integer norm order. `repeat` repeats individual elements;
+`tile` tiles entire dimensions. Both accept a scalar count for every axis or
+a vector/long-array of per-axis counts. Only `repeat` exposes an axis/count
+arity: PyTorch does not implement `tile(int, long)` or `tile(Shape)`.
+
+`requires-gradient!` changes gradient tracking and returns the same array,
+without changing its values. `gradient` reads the native gradient after
+tracking/backpropagation; the result belongs to the input manager.
+`stop-gradient` returns a detached array (shared storage on PyTorch) without
+changing the original's tracking. `to-device` resolves `tensor/device` specs
+and accepts optional `copy?` (default false): a matching device may return
+the input. A result on the manager's device retains that manager; PyTorch
+places a result on another device in a device-specific child manager.
+No in-place value operations are wrapped.
+
 Arithmetic and comparisons accept either another NDArray or a number.
 `nd/sum`, `nd/mean`, `nd/max`, `nd/min` and `nd/prod` take optional axes
 (a vector or `int-array`) and `keep-dims?`, e.g. `(nd/sum array [1] true)`.
