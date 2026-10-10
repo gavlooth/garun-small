@@ -14,13 +14,37 @@
   arguments and COPY paths. COPY uses a temporary table on the same context
   connection; materialize! creates immutable tables in the session schema."
   (:require [clojure.string :as str]
+            [garun.context :as context]
+            [garun.session :as session]
             [clojure.walk :as walk]
             [honey.sql :as sql])
-  (:import [garun.session Context Kind MaterializedTable Resource Session]
+  (:import [garun.context Context]
+           [java.lang AutoCloseable]
            [java.sql Connection PreparedStatement ResultSet ResultSetMetaData]
            [java.util UUID]))
 
 (set! *warn-on-reflection* true)
+
+(declare drop-materialized!)
+
+(defrecord MaterializedTable [owner schema table columns rows]
+  AutoCloseable
+  (close [materialized]
+    (drop-materialized! materialized (context/connection owner))))
+
+(defn materialized-table
+  "Capture metadata for a table in its owning session's generated schema."
+  [owner schema table columns rows]
+  (when-not (and (= schema (session/schema owner))
+                 (string? table) (re-matches #"t_[0-9]+" table))
+    (throw (ex-info "Materialized tables require session-generated identifiers"
+                    {:error :session/invalid-table-name :schema schema :table table})))
+  (->MaterializedTable (context/owner owner) schema table columns rows))
+
+(defmethod session/describe-value :table [_kind materialized]
+  {:sql-name (str (:schema materialized) "." (:table materialized))
+   :columns (:columns materialized)
+   :rows (:rows materialized)})
 
 (defn- invalid! [path message value]
   (throw (ex-info message {:error :table/invalid :path path :value value})))
@@ -575,25 +599,24 @@
        form))
    query))
 
-(defn- with-resolved-query [^Context context table operation]
+(defn- with-resolved-query [context table operation]
   (let [query (:query (from table))
         names (->> (tree-seq coll? seq query)
                    (filter #(and (vector? %) (= :garun/session-table (first %))))
                    (map second)
                    distinct
-                   sort)
-        ^Session owner (.session context)]
+                   sort)]
     ;; Hold all source resources through execution; deterministic ordering prevents
     ;; opposite join orders from acquiring multiple table locks in opposite orders.
     (letfn [(resolve-tables [names tables]
               (if-let [resource-name (first names)]
-                (let [^Resource resource (.resolve owner resource-name Kind/TABLE)]
-                  (.shared resource
-                           (fn [^MaterializedTable materialized]
-                             (resolve-tables
-                              (next names)
-                              (assoc tables resource-name
-                                     (keyword (str (.-schema materialized) "." (.-table materialized))))))))
+                (session/shared
+                 context resource-name :table
+                 (fn [materialized]
+                   (resolve-tables
+                    (next names)
+                    (assoc tables resource-name
+                           (keyword (str (:schema materialized) "." (:table materialized)))))))
                 (operation (resolved-query query tables))))]
       (resolve-tables names {}))))
 
@@ -605,9 +628,9 @@
   ([table]
    (sql/format (resolved-query (:query (from table)) {}) {:quoted true}))
   ([^Context context table]
-   (.call context
-          (fn []
-            (with-resolved-query context table #(sql/format % {:quoted true}))))))
+   (context/call context
+                 (fn []
+                   (with-resolved-query context table #(sql/format % {:quoted true}))))))
 
 (defn- prepare! ^PreparedStatement [^Connection connection [statement-sql & parameters]]
   (let [statement (.prepareStatement connection ^String statement-sql)]
@@ -623,7 +646,7 @@
   (with-resolved-query
     context table
     (fn [query]
-      (with-open [statement (prepare! (.connection context) (sql/format query {:quoted true}))
+      (with-open [statement (prepare! (context/connection context) (sql/format query {:quoted true}))
                   result (.executeQuery statement)]
         (operation result)))))
 
@@ -647,26 +670,26 @@
   options throw ExceptionInfo; JDBC execution failures propagate."
   ([context table] (rows context table {}))
   ([^Context context table options]
-   (.call context
-          (fn []
-            (options! :rows options [:max-rows])
-            (let [max-rows (get options :max-rows Long/MAX_VALUE)]
-              (when-not (and (integer? max-rows) (<= 0 max-rows Long/MAX_VALUE))
-                (invalid! [:rows :max-rows] "Expected a nonnegative row cap" max-rows))
-              (with-result! context table #(result-rows! % max-rows)))))))
+   (context/call context
+                 (fn []
+                   (options! :rows options [:max-rows])
+                   (let [max-rows (get options :max-rows Long/MAX_VALUE)]
+                     (when-not (and (integer? max-rows) (<= 0 max-rows Long/MAX_VALUE))
+                       (invalid! [:rows :max-rows] "Expected a nonnegative row cap" max-rows))
+                     (with-result! context table #(result-rows! % max-rows)))))))
 
 (defn columns
   "Execute through the context and return an ordered keyword-to-vector map.
   The context retains its connection; JDBC execution failures propagate."
   [^Context context table]
-  (.call context
-         (fn []
-           (with-result!
-             context table
-             (fn [^ResultSet result]
-               (let [labels (result-labels (.getMetaData result))
-                     values (result-rows! result Long/MAX_VALUE)]
-                 (apply array-map (mapcat (fn [label] [label (mapv label values)]) labels))))))))
+  (context/call context
+                (fn []
+                  (with-result!
+                    context table
+                    (fn [^ResultSet result]
+                      (let [labels (result-labels (.getMetaData result))
+                            values (result-rows! result Long/MAX_VALUE)]
+                        (apply array-map (mapcat (fn [label] [label (mapv label values)]) labels))))))))
 
 (def ^:private column-types
   {"BIGINT" :int64 "INTEGER" :int32 "DOUBLE" :float64 "FLOAT" :float32
@@ -681,27 +704,45 @@
   "Return ordered {:name string :type keyword} DuckDB column descriptors.
   The context retains its connection; JDBC execution failures propagate."
   [^Context context table]
-  (.call context
-         (fn []
-           (with-result!
-             context (query table [:limit 0])
-             (fn [^ResultSet result]
-               (let [metadata (.getMetaData result)]
-                 (mapv #(column-descriptor metadata %)
-                       (range 1 (inc (.getColumnCount metadata))))))))))
+  (context/call context
+                (fn []
+                  (with-result!
+                    context (query table [:limit 0])
+                    (fn [^ResultSet result]
+                      (let [metadata (.getMetaData result)]
+                        (mapv #(column-descriptor metadata %)
+                              (range 1 (inc (.getColumnCount metadata))))))))))
 
 (defn row-count
   "Execute COUNT(*) through the context and return a long.
   The context retains its connection; JDBC execution failures propagate."
   [^Context context table]
-  (.call context
-         (fn []
-           (long (:n (first (rows context (query table [:group-by [] {:n [:count]}]))))))))
+  (context/call context
+                (fn []
+                  (long (:n (first (rows context (query table [:group-by [] {:n [:count]}]))))))))
 
 (defn- drop-table! [^Connection connection table-name]
   (with-open [statement (prepare! connection
                                   (sql/format {:drop-table [table-name]} {:quoted true}))]
     (.execute statement)))
+
+(defn drop-materialized!
+  "Drop an owned table on the supplied releasing context's connection.
+  Generated identifiers are rechecked even for directly constructed records."
+  [materialized connection]
+  (let [{:keys [owner schema table]} materialized]
+    (when-not (and (= schema (session/schema owner))
+                   (string? table) (re-matches #"t_[0-9]+" table))
+      (throw (ex-info "Materialized tables require session-generated identifiers"
+                      {:error :session/invalid-table-name :schema schema :table table})))
+    (with-open [statement (prepare! connection
+                                    (sql/format {:drop-table [:if-exists (keyword (str schema "." table))]}
+                                                {:quoted true}))]
+      (.execute statement))))
+
+(defmethod session/release-value! MaterializedTable [_kind materialized releasing-context]
+  (drop-materialized! materialized
+                      (context/connection (or releasing-context (:owner materialized)))))
 
 (defn materialize!
   "Execute source once and register an immutable named table owned by the session.
@@ -711,45 +752,45 @@
   calling context's connection; session close drops them under its write lock."
   ([context resource-name source]
    (materialize! context resource-name source {}))
-  ([^Context context resource-name source options]
-   (.call context
-          (fn []
-            (options! :materialize! options [:replace?])
-            (when-not (keyword? resource-name)
-              (invalid! [:materialize! :name] "Materialized tables require a keyword name" resource-name))
-            (let [replace? (get options :replace? false)
-                  ^Session owner (.session context)]
-              (when-not (boolean? replace?)
-                (invalid! [:materialize! :replace?] "Replace must be boolean" replace?))
-              (let [table-name (.nextTableName owner)
-                    schema-name (.schema owner)
-                    qualified-name (keyword (str schema-name "." table-name))
-                    connection (.connection context)
-                    created-plan (plan {:select [:*] :from [[qualified-name]]} nil)]
-                (with-resolved-query
-                  context source
-                  (fn [query]
-                    (with-open [statement (prepare! connection
-                                                    (sql/format (assoc query :create-table-as [qualified-name])
-                                                                {:quoted true}))]
-                      (.execute statement))))
-                (try
-                  (let [materialized (MaterializedTable. owner schema-name table-name
-                                                         (schema context created-plan)
-                                                         (long (row-count context created-plan)))]
-                    (.register owner resource-name Kind/TABLE materialized true (boolean replace?) context)
-                    (from resource-name))
-                  (catch Throwable failure
-                    (try
-                      (drop-table! connection qualified-name)
-                      (catch Throwable cleanup-failure
-                        (.addSuppressed failure cleanup-failure)))
-                    (throw failure)))))))))
+  ([context resource-name source options]
+   (context/call
+    context
+    (fn []
+      (options! :materialize! options [:replace?])
+      (when-not (keyword? resource-name)
+        (invalid! [:materialize! :name] "Materialized tables require a keyword name" resource-name))
+      (let [replace? (get options :replace? false)]
+        (when-not (boolean? replace?)
+          (invalid! [:materialize! :replace?] "Replace must be boolean" replace?))
+        (let [table-name (session/next-table-name! context)
+              schema-name (session/schema context)
+              qualified-name (keyword (str schema-name "." table-name))
+              connection (context/connection context)
+              created-plan (plan {:select [:*] :from [[qualified-name]]} nil)]
+          (with-resolved-query
+            context source
+            (fn [query]
+              (with-open [statement (prepare! connection
+                                              (sql/format (assoc query :create-table-as [qualified-name])
+                                                          {:quoted true}))]
+                (.execute statement))))
+          (try
+            (let [materialized (materialized-table context schema-name table-name
+                                                   (schema context created-plan)
+                                                   (long (row-count context created-plan)))]
+              (session/register! context materialized {:name resource-name :kind :table :replace? replace?})
+              (from resource-name))
+            (catch Throwable failure
+              (try
+                (drop-table! connection qualified-name)
+                (catch Throwable cleanup-failure
+                  (.addSuppressed failure cleanup-failure)))
+              (throw failure)))))))))
 
 (defn- copy! [^Context context table path format]
   (when (or (not (string? path)) (empty? path) (str/includes? path "\u0000"))
     (invalid! [:copy :path] "Output path must be nonempty text without NUL" path))
-  (let [connection (.connection context)
+  (let [connection (context/connection context)
         table (from table)
         table-name (keyword (str "__garun_copy_" (str/replace (str (UUID/randomUUID)) "-" "")))
         materialized (assoc-in table [:query :create-table-as] [:temp table-name])]
@@ -771,14 +812,14 @@
   COPY's temporary table is dropped before returning; the context retains
   its connection. Invalid paths throw ExceptionInfo; JDBC failures propagate."
   [^Context context table path]
-  (.call context (fn [] (copy! context table path "CSV"))))
+  (context/call context (fn [] (copy! context table path "CSV"))))
 
 (defn write-parquet!
   "Write a table to parquet through the context's DuckDB connection.
   COPY's temporary table is dropped before returning; the context retains
   its connection. Invalid paths throw ExceptionInfo; JDBC failures propagate."
   [^Context context table path]
-  (.call context (fn [] (copy! context table path "PARQUET"))))
+  (context/call context (fn [] (copy! context table path "PARQUET"))))
 
 (defn- matrix-cell! [^ResultSet result [index column]]
   (let [value (.getObject result (int index))]
@@ -798,22 +839,48 @@
   :table/null-value and :table/non-numeric respectively. Invalid selections
   throw ExceptionInfo; JDBC failures propagate."
   [^Context context table column-selection]
-  (.call context
-         (fn []
-           (when-not (and (vector? column-selection) (seq column-selection)
-                          (every? keyword? column-selection))
-             (invalid! [:matrix :cols] "Matrix requires a nonempty keyword column vector"
-                       column-selection))
-           (with-result!
-             context (query table [:select column-selection])
-             (fn [^ResultSet result]
-               (let [indexed-columns (mapv vector (range 1 (inc (count column-selection)))
-                                           column-selection)
+  (context/call context
+                (fn []
+                  (when-not (and (vector? column-selection) (seq column-selection)
+                                 (every? keyword? column-selection))
+                    (invalid! [:matrix :cols] "Matrix requires a nonempty keyword column vector"
+                              column-selection))
+                  (with-result!
+                    context (query table [:select column-selection])
+                    (fn [^ResultSet result]
+                      (let [indexed-columns (mapv vector (range 1 (inc (count column-selection)))
+                                                  column-selection)
                     ;; Realize each row while its cursor is current; no row maps or Java
                     ;; helper/build step are needed for this functional JDBC traversal.
-                     values (sequence (comp (take-while (fn [_] (.next result)))
-                                            (mapcat (fn [_] (matrix-row! result indexed-columns))))
-                                      (range))
-                     data (float-array values)]
-                 {:rows (quot (alength data) (count column-selection))
-                  :cols (count column-selection) :data data}))))))
+                            values (sequence (comp (take-while (fn [_] (.next result)))
+                                                   (mapcat (fn [_] (matrix-row! result indexed-columns))))
+                                             (range))
+                            data (float-array values)]
+                        {:rows (quot (alength data) (count column-selection))
+                         :cols (count column-selection) :data data}))))))
+
+(defn matrices
+  "Extract float32 row-major matrices through context, one per keyword group.
+  The unique union is selected in ONE matrix query and then split/reordered
+  in memory, preserving feature/label alignment for nondeterministic sources.
+  Returned host matrices are independent of the context's manager lifetime.
+  Table NULL/nonnumeric errors propagate unchanged. Native tensors/datasets
+  are the precision-preserving path for non-float32 data."
+  [^Context context source column-groups]
+  (when-not (and (vector? column-groups) (seq column-groups)
+                 (every? #(and (vector? %) (seq %) (every? keyword? %)) column-groups))
+    (throw (ex-info "Expected nonempty groups of keyword columns"
+                    {:error :tensor/invalid-columns :value column-groups})))
+  (let [columns (vec (distinct (mapcat identity column-groups)))
+        positions (zipmap columns (range))
+        {:keys [rows data] :as matrix} (matrix context source columns)
+        column-count (:cols matrix)]
+    (mapv (fn [group]
+            (if (= group columns)
+              matrix
+              (let [indices (mapv positions group)]
+                {:rows rows :cols (count group)
+                 :data (float-array (for [row (range rows)
+                                          column indices]
+                                      (aget ^floats data (int (+ (* row column-count) column)))))})))
+          column-groups)))

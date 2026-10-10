@@ -1,5 +1,6 @@
 (ns garun.tensor-test
   (:require [clojure.test :refer [deftest is]]
+            [garun.context :as context]
             [garun.session :as session]
             [garun.table :as table]
             [garun.tensor :as tensor])
@@ -74,7 +75,7 @@
       (is (= DataType/INT64 (.getDataType nested-shorts)))
       (is (= expected (vec (.toIntArray shorts)) (vec (.toLongArray nested-shorts))))
       (is (= [2 2] (vec (.getShape (.getShape shorts)))))
-      (is (identical? (.manager ^Session current-session) (.getManager shorts)))
+      (is (identical? (context/manager ^Session current-session) (.getManager shorts)))
       (is (= [Byte/MIN_VALUE -1 0 Byte/MAX_VALUE] (vec (.toByteArray bytes))))
       (is (= [true false false true] (vec (.toBooleanArray booleans)))))
     (let [^NDArray value (tensor/array current-session [1 2 3] {:dtype :float32})]
@@ -85,7 +86,7 @@
 
 (deftest unsupported-pytorch-dtypes-fail-before-native-creation-or-casting
   (with-open [^Session current-session (session/open {:engine "PyTorch"})]
-    (let [^Engine engine (.getEngine (.manager current-session))
+    (let [^Engine engine (.getEngine (context/manager current-session))
           shorts (short-array [Short/MIN_VALUE -1 0 Short/MAX_VALUE])
           ^NDArray input (tensor/array current-session [1 2])
           ^NDArray boolean-shorts (tensor/array current-session shorts {:dtype :bool})
@@ -103,7 +104,7 @@
       (is (= [true true false true] (vec (.toBooleanArray boolean-shorts))))
       (is (= [-32768.0 -1.0 0.0 32767.0] (vec (.toDoubleArray floating-shorts))))
       (is (not (.isReleased input)))
-      (is (identical? (.manager current-session) (.getManager input)))
+      (is (identical? (context/manager current-session) (.getManager input)))
       (is (= DataType/INT32 (tensor/dtype :int32 engine)))
       (is (= DataType/BOOLEAN (tensor/dtype :bool "PyTorch")))
       (is (= :tensor/unsupported-dtype
@@ -146,17 +147,17 @@
                  (let [^NDArray array (tensor/array current-session [1 2])
                        ^NDList inputs (tensor/ndlist current-session {:data [3 4]})
                        ^NDArray listed (.singletonOrThrow inputs)]
-                   (is (identical? (.manager current-session) (.getManager array)))
-                   (is (identical? (.manager current-session) (.getManager listed)))
+                   (is (identical? (context/manager current-session) (.getManager array)))
+                   (is (identical? (context/manager current-session) (.getManager listed)))
                    [array listed]))]
     (doseq [^NDArray array arrays]
       (is (.isReleased array)))))
 
 (deftest native-array-copy-ownership-and-manager-lifetimes
   (with-open [^Session current-session (session/open)
-              ^NDManager owner (.newSubManager (.manager current-session))]
+              ^NDManager owner (.newSubManager (context/manager current-session))]
     (let [^NDArray input (tensor/array owner (long-array [9007199254740993 7]) {})
-          ^NDManager target (.newSubManager (.manager current-session))
+          ^NDManager target (.newSubManager (context/manager current-session))
           ^NDArray copy (tensor/array target input {})]
       (is (not (identical? input copy)))
       (is (identical? owner (.getManager input)))
@@ -170,14 +171,14 @@
       (is (= :tensor/closed-manager
              (error-code #(tensor/ndlist target input))))))
   (with-open [^Session current-session (session/open)
-              ^NDManager target (.newSubManager (.manager current-session))]
-    (let [^NDArray copy (with-open [source (.newSubManager (.manager current-session))]
+              ^NDManager target (.newSubManager (context/manager current-session))]
+    (let [^NDArray copy (with-open [source (.newSubManager (context/manager current-session))]
                           (tensor/array target (tensor/array source (long-array [9007199254740993]) {}) {}))]
       (is (= [9007199254740993] (vec (.toLongArray copy)))))
     (let [^NDArray closed (tensor/array target [1] {})]
       (.close closed)
       (is (= :tensor/closed-array (error-code #(tensor/array target closed {})))))
-    (with-open [source (.newSubManager (.manager current-session))]
+    (with-open [source (.newSubManager (context/manager current-session))]
       (let [^NDArray original (tensor/array source (int-array [1 2 3 4]) {})
             ^NDArray copy (tensor/array target original {:shape [2 2] :dtype :float64})]
         (is (= DataType/INT32 (.getDataType original)))
@@ -188,8 +189,8 @@
 
 (deftest ndlist-descriptors-and-native-inputs
   (with-open [^Session current-session (session/open)
-              source (.newSubManager (.manager current-session))
-              target (.newSubManager (.manager current-session))]
+              source (.newSubManager (context/manager current-session))
+              target (.newSubManager (context/manager current-session))]
     (let [^NDArray input (tensor/array source (long-array [9007199254740993 8]) {})
           native (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))]
       (with-open [copied (tensor/ndlist target native)]
@@ -224,8 +225,8 @@
                                         "SELECT x, 2 * x + 1 AS label, -x AS negative "
                                         "FROM samples ORDER BY random()")}])]
       (dotimes [_ 4]
-        (let [[features labels repeated] (tensor/table-matrices current-session source
-                                                                [[:negative :x] [:label :x] [:x :x]])
+        (let [[features labels repeated] (table/matrices current-session source
+                                                         [[:negative :x] [:label :x] [:x :x]])
               feature-values (partition 2 (:data features))
               label-values (partition 2 (:data labels))
               duplicate-values (partition 2 (:data repeated))]
@@ -236,8 +237,8 @@
                                         (= feature label-feature first-copy second-copy)))
                                  feature-values label-values duplicate-values))))))
     (is (= :table/null-value
-           (error-code #(tensor/table-matrices current-session (table/from {:x [nil] :y [1]}) [[:x] [:y]]))))
+           (error-code #(table/matrices current-session (table/from {:x [nil] :y [1]}) [[:x] [:y]]))))
     (is (= :table/non-numeric
-           (error-code #(tensor/table-matrices current-session (table/from {:x [1] :y ["text"]}) [[:x] [:y]]))))
+           (error-code #(table/matrices current-session (table/from {:x [1] :y ["text"]}) [[:x] [:y]]))))
     (is (= :tensor/invalid-columns
-           (error-code #(tensor/table-matrices current-session (table/from {:x [1]}) [[]]))))))
+           (error-code #(table/matrices current-session (table/from {:x [1]}) [[]]))))))

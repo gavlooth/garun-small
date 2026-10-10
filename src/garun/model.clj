@@ -8,6 +8,7 @@
   Registered models use session shared locks; unregistered native models remain
   borrowed and require caller synchronization."
   (:require [clojure.java.io :as io]
+            [garun.context :as context]
             [garun.session :as session]
             [garun.tensor :as tensor])
   (:import [ai.djl Application Model]
@@ -17,7 +18,7 @@
            [ai.djl.repository.zoo Criteria Criteria$Builder ModelZoo ZooModel]
            [ai.djl.translate Translator TranslatorContext TranslatorFactory]
            [ai.djl.util Progress]
-           [garun.session Context]
+           [garun.context Context]
            [java.nio.file Path]
            [java.util List Map]))
 
@@ -153,24 +154,24 @@
   (^ZooModel [context options-or-criteria]
    (load! context options-or-criteria {}))
   (^ZooModel [^Context context options-or-criteria options]
-   (.call context
-          (fn []
-            (let [options (registration-options options)
-                  selection (if (and (map? options-or-criteria)
-                                     (not (contains? options-or-criteria :device)))
-                              (assoc options-or-criteria :device
-                                     (:device (session/defaults context)))
-                              options-or-criteria)
-                  loaded (.loadModel (criteria selection))]
-              (try
-                (session/register! context loaded
-                                   (assoc options :kind :model :owned? true))
-                (catch Throwable failure
-                  (try
-                    (.close loaded)
-                    (catch Throwable close-failure
-                      (.addSuppressed failure close-failure)))
-                  (throw failure))))))))
+   (context/call context
+                 (fn []
+                   (let [options (registration-options options)
+                         selection (if (and (map? options-or-criteria)
+                                            (not (contains? options-or-criteria :device)))
+                                     (assoc options-or-criteria :device
+                                            (:device (session/defaults context)))
+                                     options-or-criteria)
+                         loaded (.loadModel (criteria selection))]
+                     (try
+                       (session/register! context loaded
+                                          (assoc options :kind :model :owned? true))
+                       (catch Throwable failure
+                         (try
+                           (.close loaded)
+                           (catch Throwable close-failure
+                             (.addSuppressed failure close-failure)))
+                         (throw failure))))))))
 
 (defn- owned-output [^TranslatorContext context output]
   ;; Stage independent tensors in the predictor manager until inference succeeds.
@@ -211,7 +212,7 @@
 
 (defn- predict-output! [^Context context ^Model model translator input]
   (with-open [^Predictor predictor (.newPredictor model (owning-translator translator))]
-    (attach-output! (.manager context) (.predict predictor input))))
+    (attach-output! (context/manager context) (.predict predictor input))))
 
 (defn predict
   "Predict one typed input under the context's session and model shared locks.
@@ -232,7 +233,7 @@
 
 (defn- batch-output! [^Context context ^Model model translator inputs]
   (with-open [^Predictor predictor (.newPredictor model (owning-translator translator))]
-    (mapv #(attach-output! (.manager context) %)
+    (mapv #(attach-output! (context/manager context) %)
           (.batchPredict predictor ^List (vec inputs)))))
 
 (defn batch-predict

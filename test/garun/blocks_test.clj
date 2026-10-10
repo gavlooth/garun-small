@@ -1,5 +1,6 @@
 (ns garun.blocks-test
   (:require [clojure.test :refer [deftest is testing]]
+            [garun.context :as context]
             [garun.blocks :as blocks]
             [garun.nn :as nn]
             [garun.session :as session])
@@ -523,7 +524,7 @@
   (let [directory (.toFile (Files/createTempDirectory "garun-last-step-" (make-array FileAttribute 0)))]
     (try
       (with-open [current-session (session/open)]
-        (let [^NDManager manager (.manager current-session)
+        (let [^NDManager manager (context/manager current-session)
               input (.create manager (float-array (range 24)) (Shape. (long-array [2 3 4])))
               inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))]
           (doseq [last-step-spec [[:last-step] [:last-step {:axis 1}]]]
@@ -571,7 +572,7 @@
         directory (.toFile (Files/createTempDirectory "garun-cnn-save-" (make-array FileAttribute 0)))]
     (try
       (with-open [current-session (session/open)]
-        (let [^NDManager manager (.manager current-session)
+        (let [^NDManager manager (context/manager current-session)
               network (nn/build current-session spec {:input-shape [1 4 4]})
               input (.ones manager (Shape. (long-array [2 1 4 4])))
               inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))]

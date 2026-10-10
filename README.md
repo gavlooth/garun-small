@@ -16,7 +16,7 @@ XGBoost, …) and visualization remain out of scope.
 ## Build and test
 
 ```sh
-clojure -T:build javac   # compile the Java leaves (session core, DJL bridges)
+clojure -T:build javac   # compile the remaining native DJL bridges
 clojure -M:test          # sessions, DuckDB, blocks, tensors, training, inference, metrics
 ```
 
@@ -28,10 +28,11 @@ The `:cuda` profile instead lets DJL download/cache the pinned CUDA library.
 
 | Namespace | Surface |
 |---|---|
+| `garun.context` | Borrowed native access: `connection`, `manager`, `owner`; lifecycle admission: `call` |
 | `garun.session` | `open`, `worker`, `defaults`, `register!`, `resource`, `value`, `shared`, `exclusive`, `release!`, `describe` |
-| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `row-count`, `matrix`, `materialize!`, `write-csv!`, `write-parquet!` |
+| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `row-count`, `matrix`, `matrices`, `materialize!`, `write-csv!`, `write-parquet!` |
 | `garun.blocks` | `compile-block`, `serializable-spec?`; Hiccup or native DJL `Block` |
-| `garun.tensor` | `device`, `dtype`, `shape`, `array`, `ndlist`, `table-matrices` |
+| `garun.tensor` | `device`, `dtype`, `shape`, `array`, `ndlist` |
 | `garun.training` | `loss`, `optimizer`, `tracker`, `initializer`, `config`; specs or native DJL components |
 | `garun.nn` | `build`, `train!`, `trainer`, `epoch!`, `validate`, `restore-best!`, `evaluate`, `predict`, `predict-with`, `save!`, `load` |
 | `garun.model` | `criteria`, `load!`, `predict`, `batch-predict`; native translators |
@@ -81,9 +82,10 @@ closeable worker with its own duplicated DuckDB connection and tensor
 sub-manager; it sees the session's registry and materialized tables.
 Predictions on one network may run concurrently; training takes the network's
 exclusive lock. Named tables are locked while a query reads them, so a
-release or replacement waits for running queries. The Java leaf
-(`java/garun/session/`) holds these locks and the registry; Clojure code holds no
-mutable state.
+release or replacement waits for running queries. Clojure Session, Worker and
+Resource types own lifecycle/resource locks and immutable registry snapshots.
+Atoms hold registry, identifier, worker and closed-state updates; native cleanup
+runs outside atom updates. Workers duplicate their parent context's connection.
 
 **Table sources:** a column map, a vector of row maps, `[:csv {:path :header? :delimiter}]`,
 `[:parquet {:path}]`, `[:json {:path}]`, `[:duckdb {:query "SELECT …"}]`, or the
@@ -278,7 +280,7 @@ executor. Explicit listeners replace the defaults.
 ## Tensors and device placement
 
 DuckDB remains the ingestion/transformation boundary. `table/matrix` returns
-row-major float32 host storage; `tensor/table-matrices` extracts multiple
+row-major float32 host storage; `table/matrices` extracts multiple
 column groups from one query. Construct DJL arrays once, then keep matrix
 arithmetic and training on native arrays. Use DJL's `NDArray` methods directly;
 there is no duplicate tensor-operation DSL.

@@ -1,5 +1,5 @@
 (ns build
-  "Compile the Java DJL bridge before loading garun.nn: clojure -T:build javac."
+  "Compile the remaining Java DJL bridges: clojure -T:build javac."
   (:require [clojure.tools.build.api :as b]))
 
 (set! *warn-on-reflection* true)

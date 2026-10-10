@@ -1,5 +1,6 @@
 (ns garun.nn-test
   (:require [clojure.datafy :as datafy]
+            [garun.context :as context]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as string]
@@ -276,7 +277,7 @@
                                           (.setSampling (int 16) false))
           dataset (.build builder)
           before (with-open [^NDList output (nn/predict current-session network features {})]
-                   (is (= (.manager current-session) (.getManager (.singletonOrThrow output))))
+                   (is (= (context/manager current-session) (.getManager (.singletonOrThrow output))))
                    (vec (.toFloatArray (.singletonOrThrow output))))
           result (nn/train! current-session network dataset
                             {:epochs 100 :validation dataset
@@ -315,7 +316,7 @@
 
 (deftest multidimensional-native-predictions-outlive-network-and-preserve-inputs
   (with-open [^Session owner (session/open)]
-    (let [^NDManager manager (.manager owner)
+    (let [^NDManager manager (context/manager owner)
           ^NDArray input (tensor/array owner (range 12) {:shape [2 2 3] :dtype :float64})
           ^NDList output
           (with-open [current-session (session/open)]
@@ -377,14 +378,14 @@
                   ^NDArray array-output (nn/predict-with current-session network array-translator inputs)
                   ^NDArray list-array (.singletonOrThrow list-output)
                   outputs [list-array array-output]]
-              (is (every? #(identical? (.manager current-session) (.getManager ^NDArray %)) outputs))
+              (is (every? #(identical? (context/manager current-session) (.getManager ^NDArray %)) outputs))
               (session/release! current-session network)
               (is (= [[3.0 4.0] [3.0 4.0]]
                      (mapv #(vec (.toFloatArray ^NDArray %)) outputs)))
               (.addi array-output (Float/valueOf (float 10)))
               (is (= [3.0 4.0] (vec (.toFloatArray input))))
               (is (= [3.0 4.0] (vec (.toFloatArray list-array))))
-              {:manager (.manager current-session) :outputs outputs}))]
+              {:manager (context/manager current-session) :outputs outputs}))]
       (is (false? (.isOpen ^NDManager manager)))
       (is (every? #(.isReleased ^NDArray %) outputs))
       (is (= [3.0 4.0] (vec (.toFloatArray input)))))))
@@ -735,7 +736,7 @@
       (is (= [(:native-trainer handle)] (vec closed-trainers)))
       (is (= description (datafy/datafy handle))))))
 
-(deftest training-operations-acquire-network-before-the-anonymous-trainer
+(deftest training-operations-synchronize-only-on-the-network
   (with-open [current-session (session/open)
               worker (session/worker current-session)]
     (let [network (nn/build current-session [:linear 1] {:input-shape [1] :name :lock-order})
@@ -743,9 +744,11 @@
                              {:x [:x] :y :y :epochs 1 :batch 41})
           exclusive session/exclusive]
       (try
-        ;; A held network must block each native training operation before it even
-        ;; attempts the trainer lock. Latches observe admission; every wait is bounded.
-        (doseq [operation [nn/validate #(nn/epoch! % {}) #(nn/restore-best! % {})]]
+        ;; A held network blocks every native training operation. The trainer
+        ;; remains lockable, and no operation attempts its resource lock.
+        (doseq [operation [nn/validate #(nn/epoch! % {}) #(nn/restore-best! % {})
+                           #(nn/train! (:context %) (:network %) (regression-table)
+                                       {:x [:x] :y :y :epochs 1 :batch 41})]]
           (let [network-attempted (CountDownLatch. (int 1))
                 trainer-attempted (CountDownLatch. (int 1))]
             (with-redefs [session/exclusive
@@ -774,8 +777,27 @@
                            [result trainer-result]))))]
                 (is (map? (.get result (long 10) TimeUnit/SECONDS)))
                 (.get trainer-result (long 10) TimeUnit/SECONDS)
-                (is (zero? (.getCount trainer-attempted)))))))
+                (is (= 1 (.getCount trainer-attempted)))))))
         (finally (session/release! current-session handle))))))
+
+(deftest trainer-release-waits-for-network-users
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session [:linear 1] {:input-shape [1]})
+          handle (nn/trainer current-session network (regression-table)
+                             {:x [:x] :y :y :epochs 1 :batch 41})
+          release (session/exclusive
+                   current-session network :network
+                   (fn [_]
+                     ;; While a network user (as epoch! does) holds the lock, a
+                     ;; release from another thread must wait instead of closing.
+                     (let [release (CompletableFuture/runAsync
+                                    (reify Runnable
+                                      (run [_] (session/release! current-session handle))))]
+                       (is (thrown? TimeoutException (.get release (long 200) TimeUnit/MILLISECONDS)))
+                       (is (map? (nn/epoch! handle {})))
+                       release)))]
+      (.get ^CompletableFuture release (long 10) TimeUnit/SECONDS)
+      (is (nil? (session/resource current-session handle :trainer))))))
 
 (deftest custom-stopping-functional-loss-and-forward-share-the-loop
   (with-open [current-session (session/open)]

@@ -13,6 +13,7 @@
   belong to the session-owned trainer."
   (:refer-clojure :exclude [load])
   (:require [clojure.core.protocols :as protocols]
+            [garun.context :as context]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as string]
@@ -35,7 +36,7 @@
            [ai.djl.training.initializer Initializer XavierInitializer]
            [ai.djl.training.loss Loss]
            [ai.djl.translate Translator TranslatorContext]
-           [garun.session Context Resource]
+           [garun.context Context]
            [java.io Writer]
            [java.util.function Consumer]))
 
@@ -133,18 +134,18 @@
   to the session defaults. Native Blocks are accepted. Optional :name names the
   network; :replace? replaces and closes an existing resource with that name."
   ^Network [^Context context spec options]
-  (.call context
-         (fn []
-           (validate-options options
-                             #{:input-shape :input-shapes :seed :device :dtype :engine :name :replace?}
-                             :build)
-           (let [network (initialize-network! spec options (session/defaults context))]
-             (try
-               (session/register! context network
-                                  (merge {:kind :network} (select-keys options [:name :replace?])))
-               (catch Throwable error
-                 (.close ^Network network)
-                 (throw error)))))))
+  (context/call context
+                (fn []
+                  (validate-options options
+                                    #{:input-shape :input-shapes :seed :device :dtype :engine :name :replace?}
+                                    :build)
+                  (let [network (initialize-network! spec options (session/defaults context))]
+                    (try
+                      (session/register! context network
+                                         (merge {:kind :network} (select-keys options [:name :replace?])))
+                      (catch Throwable error
+                        (.close ^Network network)
+                        (throw error)))))))
 
 (defn- resolve-loss [specification]
   (if (fn? specification)
@@ -243,6 +244,11 @@
   (.write writer "#garun/trainer ")
   (print-method (session/describe-value :trainer handle) writer))
 
+;; Trainer users hold the network lock; release takes it first so a release waits
+;; for a running epoch and every path orders network before trainer.
+(defmethod session/release-scope TrainingHandle [_kind handle releasing-context operation]
+  (session/exclusive releasing-context (:network handle) :network (fn [_network] (operation))))
+
 (defn trainer
   "Create a session-owned training handle. Release it with session/release! or
   leave it to session close; do not use with-open on this registered resource.
@@ -258,7 +264,7 @@
   [labels predictions] NDLists and must return a scalar NDArray."
   ^TrainingHandle [context network source options]
   (let [network-name (if (keyword? network) network
-                         (some-> ^Resource (session/resource context network :network) .-name))]
+                         (:name (session/resource context network :network)))]
     (session/exclusive
      context network :network
      (fn [network]
@@ -387,9 +393,7 @@
   Keyword regression metrics and custom functions receive original target units."
   [handle]
   (session/exclusive (:context handle) (:network handle) :network
-                     (fn [_]
-                       (session/exclusive (:context handle) handle :trainer
-                                          (fn [handle] (validation-result! handle))))))
+                     (fn [_] (validation-result! handle))))
 
 (defn- copy-parameters! [handle restore?]
   (let [^Model model (:model (:network handle))
@@ -414,10 +418,8 @@
   (session/exclusive
    (:context handle) (:network handle) :network
    (fn [_]
-     (session/exclusive (:context handle) handle :trainer
-                        (fn [handle]
-                          (when (:best state) (copy-parameters! handle true))
-                          state)))))
+     (when (:best state) (copy-parameters! handle true))
+     state)))
 
 (defn epoch!
   "Run one epoch and return immutable state with :epoch/:history/:best.
@@ -429,39 +431,36 @@
   (session/exclusive
    (:context handle) (:network handle) :network
    (fn [_]
-     (session/exclusive
-      (:context handle) handle :trainer
-      (fn [handle]
-        (when-not (map? state)
-          (invalid :nn/invalid-state "Epoch state must be a map" {:state state}))
-        (let [start (System/nanoTime)
-              ^Trainer native-trainer (:native-trainer handle)
-              training (run-dataset! handle (:dataset handle) true false)
-              validation (when (or (:validation handle) (seq (:metrics (:options handle))))
-                           (validation-result! handle))
-              monitor (if (:validation handle) :validation-loss :training-loss)
-              monitored-loss (if (:validation handle) (:loss validation) (:loss training))
-              best? (or (nil? (:best state))
-                        (< monitored-loss (- (get-in state [:best :loss])
-                                             (get-in handle [:options :early-stopping :min-delta] 0.0))))
-              epoch (inc (get state :epoch 0))
-              entry (cond-> {:epoch epoch :training-loss (:loss training)
-                             :validation-loss (when (:validation handle) (:loss validation))
-                             :best? best? :elapsed-milliseconds (/ (- (System/nanoTime) start) 1.0e6)}
-                      (:metrics validation) (assoc :metrics (:metrics validation)))
-              next-state (cond-> (-> state
-                                     (assoc :epoch epoch :stopped :completed)
-                                     (update :history (fnil conj []) entry)
-                                     (assoc :epochs-without-improvement
-                                            (if best? 0 (inc (get state :epochs-without-improvement 0)))))
-                           best? (assoc :best {:epoch epoch :loss monitored-loss :monitor monitor}))]
-          (when best? (copy-parameters! handle false))
-          (.notifyListeners native-trainer
-                            (reify Consumer
-                              (accept [_ listener] (.onEpoch ^TrainingListener listener native-trainer))))
-          (when-let [observe (:observe (:options handle))]
-            (observe (assoc entry :event :epoch :network (:network-name handle))))
-          next-state))))))
+     (when-not (map? state)
+       (invalid :nn/invalid-state "Epoch state must be a map" {:state state}))
+     (let [start (System/nanoTime)
+           ^Trainer native-trainer (:native-trainer handle)
+           training (run-dataset! handle (:dataset handle) true false)
+           validation (when (or (:validation handle) (seq (:metrics (:options handle))))
+                        (validation-result! handle))
+           monitor (if (:validation handle) :validation-loss :training-loss)
+           monitored-loss (if (:validation handle) (:loss validation) (:loss training))
+           best? (or (nil? (:best state))
+                     (< monitored-loss (- (get-in state [:best :loss])
+                                          (get-in handle [:options :early-stopping :min-delta] 0.0))))
+           epoch (inc (get state :epoch 0))
+           entry (cond-> {:epoch epoch :training-loss (:loss training)
+                          :validation-loss (when (:validation handle) (:loss validation))
+                          :best? best? :elapsed-milliseconds (/ (- (System/nanoTime) start) 1.0e6)}
+                   (:metrics validation) (assoc :metrics (:metrics validation)))
+           next-state (cond-> (-> state
+                                  (assoc :epoch epoch :stopped :completed)
+                                  (update :history (fnil conj []) entry)
+                                  (assoc :epochs-without-improvement
+                                         (if best? 0 (inc (get state :epochs-without-improvement 0)))))
+                        best? (assoc :best {:epoch epoch :loss monitored-loss :monitor monitor}))]
+       (when best? (copy-parameters! handle false))
+       (.notifyListeners native-trainer
+                         (reify Consumer
+                           (accept [_ listener] (.onEpoch ^TrainingListener listener native-trainer))))
+       (when-let [observe (:observe (:options handle))]
+         (observe (assoc entry :event :epoch :network (:network-name handle))))
+       next-state))))
 
 (defn train!
   "The default reduction over trainer/epoch!, for tables and native Datasets.
@@ -517,7 +516,7 @@
       (with-open [^NDManager manager (.newSubManager (.getNDManager model))]
         (let [features (examples/standardized-array manager (:features examples)
                                                     (get-in specification [:statistics :x]) false)]
-          (with-open [^NDList result (predict-native network features {:manager manager} (.manager context))]
+          (with-open [^NDList result (predict-native network features {:manager manager} (context/manager context))]
             (when-not (= 1 (.size result))
               (invalid :nn/non-tabular-output "Table predictions require a single output tensor"
                        {:outputs (.size result)}))
@@ -560,7 +559,7 @@
                                      (and (vector? input) (or (keyword? (first input))
                                                               (map? (first input)))))))
                       (predict-table context network input options)
-                      (predict-native network input options (.manager context))))))
+                      (predict-native network input options (context/manager context))))))
 
 (defn- evaluate-native! [network ^Dataset source requested loss-specification]
   (let [^Model model (:model network)
@@ -585,7 +584,7 @@
                                                   (get-in specification [:statistics :x]) false)
             labels (examples/standardized-array manager (:labels prepared)
                                                 (get-in specification [:statistics :y]) (= loss-tag :ce))]
-        (with-open [^NDList result (predict-native network features {:manager manager} (.manager context))]
+        (with-open [^NDList result (predict-native network features {:manager manager} (context/manager context))]
           (let [^NDArray value (.evaluate loss
                                           (NDList. ^"[Lai.djl.ndarray.NDArray;"
                                            (into-array NDArray [labels])) result)
@@ -659,7 +658,7 @@
        (with-open [^Predictor predictor (.newPredictor model wrapper ^Device (:device network))]
          (let [result (.predict predictor input)]
            (when (or (instance? NDArray result) (instance? NDList result))
-             (.attach ^NDResource result (.manager context)))
+             (.attach ^NDResource result (context/manager context)))
            result))))))
 
 (defn save!
@@ -720,28 +719,28 @@
   :replace? control session registration. Failed loads close the new Model."
   ([context directory] (load context directory {}))
   ([^Context context directory options]
-   (.call context
-          (fn []
-            (validate-options options #{:spec :device :dtype :engine :name :replace?} :load)
-            (let [file (io/file directory)
-                  metadata (validate-options
-                            (edn/read-string (slurp (io/file file "spec.edn")))
-                            #{:spec :input-shapes :dtype :engine :device :requires-spec?} :saved-spec)
-                  spec (if (contains? options :spec) (:spec options) (:spec metadata))
-                  _ (when (nil? spec)
-                      (invalid :nn/missing-reconstruction-spec
-                               "Saved custom network requires :spec on load" {}))
-                  build-options (merge (select-keys metadata [:input-shapes :engine :device])
-                                       {:dtype (DataType/valueOf ^String (:dtype metadata))}
-                                       (select-keys options [:dtype :engine :device]))
-                  network (initialize-network! spec build-options (session/defaults context))
-                  ^Model model (:model network)]
-              (try
-                (.load model (.toPath file) "garun")
-                (when (contains? options :dtype)
-                  (cast-parameters! model (:dtype network)))
-                (session/register! context network
-                                   (merge {:kind :network} (select-keys options [:name :replace?])))
-                (catch Throwable error
-                  (.close model)
-                  (throw error))))))))
+   (context/call context
+                 (fn []
+                   (validate-options options #{:spec :device :dtype :engine :name :replace?} :load)
+                   (let [file (io/file directory)
+                         metadata (validate-options
+                                   (edn/read-string (slurp (io/file file "spec.edn")))
+                                   #{:spec :input-shapes :dtype :engine :device :requires-spec?} :saved-spec)
+                         spec (if (contains? options :spec) (:spec options) (:spec metadata))
+                         _ (when (nil? spec)
+                             (invalid :nn/missing-reconstruction-spec
+                                      "Saved custom network requires :spec on load" {}))
+                         build-options (merge (select-keys metadata [:input-shapes :engine :device])
+                                              {:dtype (DataType/valueOf ^String (:dtype metadata))}
+                                              (select-keys options [:dtype :engine :device]))
+                         network (initialize-network! spec build-options (session/defaults context))
+                         ^Model model (:model network)]
+                     (try
+                       (.load model (.toPath file) "garun")
+                       (when (contains? options :dtype)
+                         (cast-parameters! model (:dtype network)))
+                       (session/register! context network
+                                          (merge {:kind :network} (select-keys options [:name :replace?])))
+                       (catch Throwable error
+                         (.close model)
+                         (throw error))))))))

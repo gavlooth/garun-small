@@ -157,7 +157,7 @@
                                                 (column-vector order-by :nn/invalid-sequence))]])
                  source)
         groups (cond-> [columns] labels? (conj label-columns) sequence (conj [window-end-column]))
-        matrices (tensor/table-matrices context source groups)
+        matrices (table/matrices context source groups)
         features (first matrices)
         labels (when labels? (second matrices))
         window-ends (when sequence (last matrices))

@@ -1,5 +1,6 @@
 (ns garun.optimizers-test
   (:require [clojure.test :refer [deftest is testing]]
+            [garun.context :as context]
             [garun.session :as session]
             [garun.tensor :as tensor]
             [garun.training :as training])
@@ -90,7 +91,7 @@
               ^NDArray weight (tensor/array current-session [[1.0 -2.0] [0.5 3.0]] {:dtype :float32})
               gradients [[2.0 -4.0 0.25 -0.5] [-1.0 3.0 0.75 -2.0]]]
           (reduce (fn [expected [update values]]
-                    (with-open [^NDManager batch (.newSubManager (.manager current-session))]
+                    (with-open [^NDManager batch (.newSubManager (context/manager current-session))]
                       (let [^NDArray gradient (tensor/array batch values {:shape [2 2] :dtype :float32})
                             next-values (mapv #(reference-step tag options update %1 %2) expected values)]
                         (.update optimizer "matrix" weight gradient)
@@ -218,7 +219,7 @@
     (testing (name tag)
       (let [state-arrays
             (with-open [^Session current-session (session/open {:device :cpu})
-                        ^NDManager owner (.newSubManager (.manager current-session))]
+                        ^NDManager owner (.newSubManager (context/manager current-session))]
               (let [^Optimizer optimizer (training/optimizer [tag options])
                     ^NDArray weight (tensor/array owner [[1.0 2.0] [3.0 4.0]] {:dtype :float64})]
                 (with-open [^NDManager batch (.newSubManager owner)
@@ -250,7 +251,7 @@
 (deftest parameters-have-independent-history-and-closed-manager-state-is-not-reused
   (let [^Optimizer optimizer (training/optimizer [:nag {:lr 0.1 :momentum 0.5}])]
     (with-open [^Session current-session (session/open {:device :cpu})]
-      (with-open [^NDManager manager (.newSubManager (.manager current-session))]
+      (with-open [^NDManager manager (.newSubManager (context/manager current-session))]
         (let [^NDArray first-weight (tensor/array manager [1.0] {:dtype :float32})
               ^NDArray second-weight (tensor/array manager [1.0] {:dtype :float32})
               ^NDArray gradient (tensor/array manager [2.0] {:dtype :float32})]
@@ -259,7 +260,7 @@
           (.update optimizer "second" second-weight gradient)
           (is (near? 0.35 (first (.toFloatArray first-weight))))
           (is (near? 0.7 (first (.toFloatArray second-weight))))))
-      (with-open [^NDManager replacement (.newSubManager (.manager current-session))]
+      (with-open [^NDManager replacement (.newSubManager (context/manager current-session))]
         (let [^NDArray weight (tensor/array replacement [1.0] {:dtype :float32})
               ^NDArray gradient (tensor/array replacement [2.0] {:dtype :float32})]
           (.update optimizer "first" weight gradient)
@@ -267,7 +268,7 @@
 
 (deftest updates-preserve-autograd-parameters-and-clear-attached-gradients
   (with-open [^Session current-session (session/open {:device :cpu})]
-    (let [^NDManager manager (.manager current-session)
+    (let [^NDManager manager (context/manager current-session)
           ^Optimizer optimizer (training/optimizer [:sgd {:lr 0.1}])
           ^NDArray weight (tensor/array current-session [1.0] {:dtype :float32})]
       (.setRequiresGradient weight true)

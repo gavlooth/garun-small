@@ -8,12 +8,12 @@
   NDList closes its elements, not its manager.
   Use native NDArray methods directly for general tensor operations."
   (:require [clojure.string :as str]
-            [garun.table :as table])
+            [garun.context :as context])
   (:import [ai.djl Device]
            [ai.djl.engine Engine]
            [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.types DataType Shape]
-           [garun.session Context]
+           [garun.context Context]
            [java.nio Buffer ByteBuffer DoubleBuffer FloatBuffer IntBuffer LongBuffer ShortBuffer]
            [java.nio.charset StandardCharsets]))
 
@@ -268,7 +268,7 @@
   (^NDArray [owner data] (array owner data {}))
   (^NDArray [owner data options]
    (if (instance? Context owner)
-     (.call ^Context owner #(manager-array (.manager ^Context owner) data options))
+     (context/call ^Context owner #(manager-array (context/manager ^Context owner) data options))
      (manager-array owner data options))))
 
 (defn- input-descriptor? [input]
@@ -307,30 +307,6 @@
   no inputs."
   ^NDList [owner inputs]
   (if (instance? Context owner)
-    (.call ^Context owner #(manager-ndlist (.manager ^Context owner) inputs))
+    (context/call ^Context owner #(manager-ndlist (context/manager ^Context owner) inputs))
     (manager-ndlist owner inputs)))
 
-(defn table-matrices
-  "Extract float32 row-major matrices through context, one per keyword group.
-  The unique union is selected in ONE table/matrix query and then split/reordered
-  in memory, preserving feature/label alignment for nondeterministic sources.
-  Returned host matrices are independent of the context's manager lifetime.
-  Table NULL/nonnumeric errors propagate unchanged. Native tensors/datasets
-  are the precision-preserving path for non-float32 data."
-  [^Context context source column-groups]
-  (when-not (and (vector? column-groups) (seq column-groups)
-                 (every? #(and (vector? %) (seq %) (every? keyword? %)) column-groups))
-    (invalid! :tensor/invalid-columns "Expected nonempty groups of keyword columns" column-groups))
-  (let [columns (vec (distinct (mapcat identity column-groups)))
-        positions (zipmap columns (range))
-        {:keys [rows data] :as matrix} (table/matrix context source columns)
-        column-count (:cols matrix)]
-    (mapv (fn [group]
-            (if (= group columns)
-              matrix
-              (let [indices (mapv positions group)]
-                {:rows rows :cols (count group)
-                 :data (float-array (for [row (range rows)
-                                          column indices]
-                                      (aget ^floats data (int (+ (* row column-count) column)))))})))
-          column-groups)))

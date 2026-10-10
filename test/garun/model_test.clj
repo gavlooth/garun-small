@@ -1,5 +1,6 @@
 (ns garun.model-test
   (:require [clojure.datafy :as datafy]
+            [garun.context :as context]
             [clojure.edn :as edn]
             [clojure.test :refer [deftest is]]
             [garun.model :as model]
@@ -92,7 +93,7 @@
                 (is (= [1.0 2.0 3.0 4.0]
                        (vec (.toFloatArray (.singletonOrThrow input)))))
                 (is (not (identical? (.singletonOrThrow input) (.singletonOrThrow output))))
-                (is (identical? (.manager current-session) (.getManager output)))
+                (is (identical? (context/manager current-session) (.getManager output)))
                 (is (false? (.isReleased (.singletonOrThrow output))))
                 (is (= :fixture (:name resource)))
                 (is (= :model (:kind resource)))
@@ -104,7 +105,7 @@
                 (is (= "PyTorch" (:engine resource)))
                 (is (= description (datafy/datafy current-session)))
                 {:loaded loaded :output (.singletonOrThrow output)
-                 :manager (.manager current-session)}))]
+                 :manager (context/manager current-session)}))]
         (is (false? (.isOpen (.getNDManager ^Model loaded))))
         (is (false? (.isOpen ^NDManager manager)))
         (is (true? (.isReleased ^NDArray output)))))))
@@ -158,14 +159,14 @@
               array-batch (model/batch-predict current-session :fixture translator [input input])]
           (is (identical? loaded (session/value current-session :fixture :model)))
           (is (= [6.0 14.0] (vec (.toFloatArray output))))
-          (is (identical? (.manager current-session) (.getManager output)))
+          (is (identical? (context/manager current-session) (.getManager output)))
           (is (= [[6.0 14.0] [6.0 14.0]]
                  (mapv (fn [^NDList output]
-                         (is (identical? (.manager current-session) (.getManager output)))
+                         (is (identical? (context/manager current-session) (.getManager output)))
                          (vec (.toFloatArray (.singletonOrThrow output)))) batch)))
           (is (= [[6.0 14.0] [6.0 14.0]]
                  (mapv (fn [^NDArray output]
-                         (is (identical? (.manager current-session) (.getManager output)))
+                         (is (identical? (context/manager current-session) (.getManager output)))
                          (vec (.toFloatArray output))) array-batch)))
           (is (= [1.0 2.0 3.0 4.0]
                  (vec (.toFloatArray (.singletonOrThrow input))))))))))
@@ -229,7 +230,7 @@
 (deftest noop-identity-output-does-not-steal-input-ownership
   (with-open [^Session current-session (session/open)
               native (Model/newInstance "identity" (Device/cpu) "PyTorch")
-              manager (.newSubManager (.manager current-session))
+              manager (.newSubManager (context/manager current-session))
               input (tensor/ndlist manager [{:data [[1 2]] :dtype :float32}])]
     (let [^Block block (Blocks/identityBlock)]
       (.setBlock native block)

@@ -1,5 +1,6 @@
 (ns garun.losses-test
   (:require [clojure.test :refer [deftest is testing]]
+            [garun.context :as context]
             [garun.session :as session]
             [garun.tensor :as tensor]
             [garun.training.losses :as losses])
@@ -7,7 +8,7 @@
            [ai.djl.ndarray.types DataType]
            [ai.djl.training GradientCollector]
            [ai.djl.training.loss Loss]
-           [garun.session Context]))
+           [garun.context Context]))
 
 (set! *warn-on-reflection* true)
 
@@ -24,7 +25,7 @@
 (defn- evaluate-with-gradient!
   [^Context context ^Loss loss labels ^NDArray predictions]
   (.setRequiresGradient predictions true)
-  (with-open [^GradientCollector collector (.newGradientCollector (.getEngine (.manager context)))]
+  (with-open [^GradientCollector collector (.newGradientCollector (.getEngine (context/manager context)))]
     (let [^NDArray result (.evaluate loss (ndlist labels) (ndlist [predictions]))
           result-values (values result)
           result-shape (vec (.getShape (.getShape result)))]

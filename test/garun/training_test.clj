@@ -1,5 +1,6 @@
 (ns garun.training-test
   (:require [clojure.test :refer [deftest is]]
+            [garun.context :as context]
             [garun.session :as session]
             [garun.tensor :as tensor]
             [garun.training :as training])
@@ -82,7 +83,7 @@
 
 (deftest native-regularization-values-and-gradients
   (with-open [^Session current-session (session/open {:device :cpu})]
-    (let [^NDManager manager (.manager current-session)
+    (let [^NDManager manager (context/manager current-session)
           ^NDArray parameters (tensor/array current-session [-2.0 3.0] {:dtype :float32})
           parameter-list (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [parameters]))
           predictions (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [(.zeros manager (Shape. (long-array [2])))]))
@@ -169,14 +170,14 @@
     (doseq [[spec expected] [[:zeros 0] [:ones 1] [[:constant {:value -2}] -2]
                              [(training/initializer [:constant {:value 3}]) 3]]]
       (let [^Initializer component (training/initializer spec)
-            ^NDArray values (.initialize component (.manager current-session) (Shape. (long-array [2 3])) DataType/FLOAT32)]
+            ^NDArray values (.initialize component (context/manager current-session) (Shape. (long-array [2 3])) DataType/FLOAT32)]
         (is (= [2 3] (vec (.getShape (.getShape values)))))
         (is (every? #(near? expected %) (.toFloatArray values)))))
     (doseq [[spec bound] [[[:uniform {:scale 0.2}] 0.2]
                           [[:truncated-normal {:sigma 0.1}] 0.2]
                           [[:xavier {:random :uniform :factor :in :magnitude 3}] 0.5]]]
       (let [^Initializer component (training/initializer spec)
-            ^NDArray values (.initialize component (.manager current-session) (Shape. (long-array [24 12])) DataType/FLOAT32)
+            ^NDArray values (.initialize component (context/manager current-session) (Shape. (long-array [24 12])) DataType/FLOAT32)
             numbers (vec (.toFloatArray values))]
         (is (every? #(<= (Math/abs (double %)) (+ bound 1.0e-6)) numbers))
         (is (some pos? numbers))

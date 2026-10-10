@@ -1,13 +1,16 @@
 (ns garun.session-test
-  "Behavioral boundaries for session ownership and the Java concurrency leaf."
+  "Behavioral boundaries for Clojure session ownership and native lifetime locks."
   (:require [clojure.datafy :as datafy]
+            [garun.context :as context]
+            [garun.table :as table]
             [clojure.string :as string]
             [clojure.test :refer [deftest is]]
             [garun.session :as session])
   (:import [ai.djl Device]
            [ai.djl.ndarray NDManager]
            [ai.djl.ndarray.types DataType]
-           [garun.session MaterializedTable Resource Session]
+           [garun.session Resource Session]
+           [garun.table MaterializedTable]
            [java.lang AutoCloseable]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
@@ -39,11 +42,11 @@
       (.getLong result (int 1)))))
 
 (defn- materialized-table! ^MaterializedTable [^Session current-session]
-  (let [table-name (.nextTableName current-session)
-        schema-name (.schema current-session)]
-    (execute! (.connection current-session)
+  (let [table-name (session/next-table-name! current-session)
+        schema-name (session/schema current-session)]
+    (execute! (context/connection current-session)
               (str "CREATE TABLE \"" schema-name "\".\"" table-name "\" AS SELECT 7::BIGINT AS number"))
-    (MaterializedTable. current-session schema-name table-name [{:name "number" :type :int64}] (long 1))))
+    (table/materialized-table current-session schema-name table-name [{:name "number" :type :int64}] 1)))
 
 (deftest session-defaults-and-closed-options
   (with-open [current-session (session/open)]
@@ -54,12 +57,12 @@
       (is (= (Device/cpu) device))
       (is (= DataType/FLOAT32 data-type))
       (is (= 11 seed))
-      (is (= (.getEngineName (.getEngine (.manager current-session))) engine))
+      (is (= (.getEngineName (.getEngine (context/manager current-session))) engine))
       (is (= ":memory" (:database (session/describe current-session))))
       (is (= {:class "java.lang.Object"} (session/describe-value :unregistered (Object.))))
-      (is (identical? current-session (.session current-session)))
-      (is (.isOpen (.manager current-session)))
-      (is (not (.isClosed (.connection current-session))))))
+      (is (identical? current-session (context/owner current-session)))
+      (is (.isOpen (context/manager current-session)))
+      (is (not (.isClosed (context/connection current-session))))))
   (with-open [current-session (session/open {:device :cpu :dtype :float64 :engine "PyTorch" :seed 37})]
     (is (= {:device (Device/cpu) :dtype DataType/FLOAT64 :engine "PyTorch" :seed 37}
            (session/defaults current-session))))
@@ -87,11 +90,11 @@
           (is (= :cpu (:device session-description)))
           (is (= :float32 (:dtype session-description)))
           (is (= [resource-description] (:resources session-description)))
-          (is (= {:session-identifier (.identifier current-session) :status :open} worker-description))
+          (is (= {:session-identifier (session/identifier current-session) :status :open} worker-description))
           (is (= #{:identifier :name :kind :owned? :released? :sql-name :columns :rows}
                  (set (keys resource-description))))
           (is (= {:name :sample :kind :table :owned? true :released? false
-                  :sql-name (str (.schema current-session) "." (.-table table))
+                  :sql-name (str (session/schema current-session) "." (:table table))
                   :columns [{:name "number" :type :int64}] :rows 1}
                  (dissoc resource-description :identifier)))
           (doseq [[value description tag] [[current-session session-description "#garun/session "]
@@ -119,7 +122,7 @@
       (is (identical? first-value
                       (session/register! current-session first-value {:kind :network :name :network})))
       (let [^Resource resource (session/resource current-session :network :network)]
-        (is (identical? first-value (.-value resource)))
+        (is (identical? first-value (session/shared-resource resource identity)))
         (is (identical? resource (session/resource current-session first-value :network)))
         (is (identical? first-value (session/value current-session :network :network)))
         (is (identical? first-value (session/value current-session first-value :network)))
@@ -134,17 +137,17 @@
                         (session/register! current-session replacement
                                            {:kind :network :name :network :replace? true})))
         (is (= [:first] (vec recording)))
-        (is (.isReleased resource))
-        (is (= :session/released (error-code #(.shared resource identity))))
-        (is (= :session/released (error-code #(.exclusive resource identity)))))
+        (is (:released? resource))
+        (is (= :session/released (error-code #(session/shared-resource resource identity))))
+        (is (= :session/released (error-code #(session/exclusive-resource resource identity)))))
       (session/register! current-session anonymous {:kind :network})
       (session/register! current-session borrowed {:kind :network :name :borrowed :owned? false})
       (let [^Resource anonymous-resource (session/resource current-session anonymous :network)
-            resources (.resources current-session)]
-        (is (nil? (.-name anonymous-resource)))
+            resources (session/resources current-session)]
+        (is (nil? (:name anonymous-resource)))
         (is (= 3 (count resources)))
-        (is (= (sort (map #(.-identifier ^Resource %) resources))
-               (map #(.-identifier ^Resource %) resources))))
+        (is (= (sort (map :identifier resources))
+               (map :identifier resources))))
       (is (nil? (session/release! current-session :network)))
       (is (= [:first :replacement] (vec recording)))
       (is (= :session/unknown-name (error-code #(session/resource current-session :network :network))))
@@ -160,7 +163,7 @@
           trainer (recorded-resource recording :trainer)]
       (is (identical? trainer
                       (session/register! current-session trainer {:kind :trainer :name :training})))
-      (is (identical? trainer (.-value ^Resource (session/resource current-session :training :trainer))))
+      (is (identical? trainer (session/shared-resource (session/resource current-session :training :trainer) identity)))
       (is (identical? trainer (session/value current-session :training :trainer)))
       (is (identical? trainer (session/shared current-session :training :trainer identity)))
       (is (identical? trainer (session/exclusive current-session :training :trainer identity)))
@@ -204,20 +207,20 @@
         (is (identical? last-failure failure))
         (is (= [first-failure] (vec (.getSuppressed ^Throwable failure))))
         (is (= [:last :first] (vec recording)))
-        (is (.isClosed current-session))
-        (is (not (.isOpen (.manager current-session))))
-        (is (.isClosed (.connection current-session)))
+        (is (session/closed? current-session))
+        (is (not (.isOpen (context/manager current-session))))
+        (is (.isClosed (context/connection current-session)))
         (is (nil? (.close current-session)))))))
 
 (deftest lifecycle-rejects-closed-calls-and-reentrant-close
   (let [current-session (session/open)]
     (try
       (is (= :session/close-inside-operation
-             (error-code #(.call current-session (fn [] (.close current-session))))))
+             (error-code #(context/call current-session (fn [] (.close current-session))))))
       (is (= :open (:status (session/describe current-session))))
-      (is (= :nested (.call current-session (fn [] (.call current-session (constantly :nested))))))
+      (is (= :nested (context/call current-session (fn [] (context/call current-session (constantly :nested))))))
       (.close current-session)
-      (is (= :session/closed (error-code #(.call current-session (constantly :unexpected)))))
+      (is (= :session/closed (error-code #(context/call current-session (constantly :unexpected)))))
       (is (= :session/closed (error-code #(session/worker current-session))))
       (is (= :session/closed
              (error-code #(session/register! current-session (Object.) {:kind :network :name :closed}))))
@@ -230,35 +233,35 @@
 (deftest workers-own-connections-and-sub-managers
   (let [current-session (session/open)
         current-worker (session/worker current-session)
-        ^NDManager worker-manager (.manager current-worker)
-        worker-connection (.connection current-worker)]
+        ^NDManager worker-manager (context/manager current-worker)
+        worker-connection (context/connection current-worker)]
     (try
       (is (session/context? current-worker))
-      (is (identical? current-session (.session current-worker)))
-      (is (not (identical? (.connection current-session) worker-connection)))
-      (is (not (identical? (.manager current-session) worker-manager)))
-      (is (identical? (.manager current-session) (.getParentManager worker-manager)))
+      (is (identical? current-session (context/owner current-worker)))
+      (is (not (identical? (context/connection current-session) worker-connection)))
+      (is (not (identical? (context/manager current-session) worker-manager)))
+      (is (identical? (context/manager current-session) (.getParentManager worker-manager)))
       (is (= (session/defaults current-session) (session/defaults current-worker)))
-      (is (= 1 (.workerCount current-session)))
+      (is (= 1 (session/worker-count current-session)))
       (let [table (materialized-table! current-session)
-            query-text (str "SELECT number FROM \"" (.-schema table) "\".\"" (.-table table) "\"")]
-        (is (= 7 (.call current-worker #(scalar worker-connection query-text)))))
+            query-text (str "SELECT number FROM \"" (:schema table) "\".\"" (:table table) "\"")]
+        (is (= 7 (context/call current-worker #(scalar worker-connection query-text)))))
       (.close current-worker)
-      (is (.isClosed current-worker))
+      (is (session/closed? current-worker))
       (is (.isClosed worker-connection))
       (is (not (.isOpen worker-manager)))
-      (is (.isOpen (.manager current-session)))
-      (is (zero? (.workerCount current-session)))
+      (is (.isOpen (context/manager current-session)))
+      (is (zero? (session/worker-count current-session)))
       (is (= :closed (:status (datafy/datafy current-worker))))
-      (is (= :session/closed (error-code #(.call current-worker (constantly :unexpected)))))
+      (is (= :session/closed (error-code #(context/call current-worker (constantly :unexpected)))))
       (is (nil? (.close current-worker)))
       (let [open-worker (session/worker current-session)]
         (.close current-session)
-        (is (.isClosed open-worker))
-        (is (not (.isOpen (.manager open-worker))))
-        (is (.isClosed (.connection open-worker)))
-        (is (zero? (.workerCount current-session)))
-        (is (= :session/closed (error-code #(.call open-worker (constantly :unexpected))))))
+        (is (session/closed? open-worker))
+        (is (not (.isOpen (context/manager open-worker))))
+        (is (.isClosed (context/connection open-worker)))
+        (is (zero? (session/worker-count current-session)))
+        (is (= :session/closed (error-code #(context/call open-worker (constantly :unexpected))))))
       (finally
         (.close current-worker)
         (.close current-session)))))
@@ -315,7 +318,7 @@
       (let [schema-name (with-open [current-session (session/open {:database database})]
                           (is (= database (:database (session/describe current-session))))
                           (materialized-table! current-session)
-                          (.schema current-session))]
+                          (session/schema current-session))]
         (with-open [connection (DriverManager/getConnection (str "jdbc:duckdb:" database))
                     statement (.prepareStatement connection
                                                  "SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?")]
@@ -327,3 +330,52 @@
         (Files/deleteIfExists (.resolve directory "session.duckdb.wal"))
         (Files/deleteIfExists database-path)
         (Files/deleteIfExists directory)))))
+
+(deftest failed-replacement-removes-the-old-resource-without-owning-the-new-value
+  (with-open [current-session (session/open)]
+    (let [failure (Exception. "old cleanup failed")
+          recording (ConcurrentLinkedQueue.)
+          previous (reify AutoCloseable (close [_] (throw failure)))
+          replacement (recorded-resource recording :replacement)]
+      (session/register! current-session previous {:kind :network :name :replaced})
+      (let [registered (session/resource current-session :replaced :network)]
+        (is (identical? failure
+                        (try
+                          (session/register! current-session replacement
+                                             {:kind :network :name :replaced :replace? true})
+                          (catch Throwable thrown thrown))))
+        (is (:released? registered))
+        (is (= :session/unknown-name
+               (error-code #(session/resource current-session :replaced :network))))
+        (is (= [] (session/resources current-session)))
+        (.close current-session)
+        (is (.isEmpty recording))
+        (.close ^AutoCloseable replacement)
+        (is (= [:replacement] (vec recording)))))))
+
+(deftest lifecycle-and-resource-locks-reject-read-lock-upgrades
+  (with-open [current-session (session/open)
+              current-worker (session/worker current-session)]
+    (is (= :session/close-inside-operation
+           (error-code #(context/call current-worker (fn [] (.close current-worker))))))
+    (is (not (session/closed? current-worker)))
+    (session/register! current-session (Object.) {:kind :network :name :read-locked})
+    (is (= :session/close-inside-operation
+           (error-code #(session/shared current-session :read-locked :network
+                                        (fn [_] (session/release! current-session :read-locked))))))
+    (is (false? (:released? (session/resource current-session :read-locked :network))))
+    (is (nil? (session/exclusive current-session :read-locked :network
+                                 (fn [_] (session/release! current-session :read-locked)))))
+    (is (= :session/unknown-name
+           (error-code #(session/resource current-session :read-locked :network))))))
+
+(deftest materialized-table-identifiers-remain-generated-only
+  (with-open [current-session (session/open)]
+    (doseq [[schema table-name] [["other_schema" "t_1"]
+                                 [(session/schema current-session) "t_"]
+                                 [(session/schema current-session) "t_1; DROP SCHEMA other_schema"]
+                                 [(session/schema current-session) nil]]]
+      (is (= :session/invalid-table-name
+             (error-code #(table/materialized-table current-session schema table-name [] 0)))))
+    (let [unchecked (table/->MaterializedTable current-session "other_schema" "t_1" [] 0)]
+      (is (= :session/invalid-table-name (error-code #(.close ^AutoCloseable unchecked)))))))
