@@ -3,8 +3,8 @@
   regression, partitioned battery sequences with early stopping, a custom epoch
   loop and a model save/load round trip. DuckDB range() generates all data without
   downloads. Trusted SQL only generates rows; Garun Hiccup selects and splits them.
-  Classification validates on its toy training data to illustrate metrics, not
-  to estimate generalization; the battery example holds out whole batteries."
+  Binary, multiclass and regression use seeded, sample-keyed held-out validation;
+  the battery example holds out whole batteries."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
             [garun.nn :as nn]
@@ -16,20 +16,29 @@
 (set! *warn-on-reflection* true)
 
 (def binary-data
-  [:duckdb {:query (str "SELECT (i - 15.5) / 8.0 AS x, "
+  [:duckdb {:query (str "SELECT i AS sample_id, (i - 15.5) / 8.0 AS x, "
                         "CASE WHEN i >= 16 THEN 1 ELSE 0 END AS label "
                         "FROM range(32) AS samples(i)")}])
 
 (def multiclass-data
-  [:duckdb {:query (str "SELECT CASE i % 3 WHEN 0 THEN -2.0 "
+  [:duckdb {:query (str "SELECT i AS sample_id, CASE i % 3 WHEN 0 THEN -2.0 "
                         "WHEN 1 THEN 2.0 ELSE 0.0 END AS horizontal, "
                         "CASE i % 3 WHEN 2 THEN 2.0 ELSE -2.0 END AS vertical, "
                         "i % 3 AS label FROM range(30) AS samples(i)")}])
 
 (def regression-data
-  [:duckdb {:query (str "SELECT (i - 15.5) / 16.0 AS x, "
+  [:duckdb {:query (str "SELECT i AS sample_id, (i - 15.5) / 16.0 AS x, "
                         "100.0 + 20.0 * (i - 15.5) / 16.0 AS target "
                         "FROM range(32) AS samples(i)")}])
+
+(def binary-partitions
+  (table/query binary-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
+
+(def multiclass-partitions
+  (table/query multiclass-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
+
+(def regression-partitions
+  (table/query regression-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
 
 (def battery-data
   [:duckdb {:query (str "SELECT i // 8 AS battery_id, i % 8 AS cycle, "
@@ -47,7 +56,7 @@
 (def binary-options
   {:x [:x] :y :label :loss :bce
    :optim [:adam {:lr 0.15}] :epochs 8 :batch 32 :shuffle? false
-   :validation binary-data :metrics [:accuracy :f1] :observe tap>})
+   :metrics [:accuracy :f1] :observe tap>})
 
 (def battery-options
   {:x [:voltage :temperature] :y :remaining_life
@@ -80,37 +89,41 @@
 (defn run!
   "Train all five examples and return losses, predictions, metrics and persistence evidence."
   []
-  (let [directory (str (Files/createTempDirectory "garun-gallery-model-"
+  (let [[binary-training binary-validation] binary-partitions
+        [multiclass-training multiclass-validation] multiclass-partitions
+        [regression-training regression-validation] regression-partitions
+        directory (str (Files/createTempDirectory "garun-gallery-model-"
                                                   (make-array FileAttribute 0)))]
     (try
       (with-open [current-session (session/open {:seed 7 :device :cpu})]
         ;; BCE takes logits: no sigmoid in the network. Metrics convert logits for us.
         (nn/build current-session [:linear 1] {:input-shape [1] :name :binary})
-        (let [binary-result (nn/train! current-session :binary binary-data binary-options)
-              binary-classes (nn/predict current-session :binary binary-data {:output :class})
-              binary-probabilities (nn/predict current-session :binary binary-data
+        (let [binary-result (nn/train! current-session :binary binary-training
+                                       (assoc binary-options :validation binary-validation))
+              binary-classes (nn/predict current-session :binary binary-validation {:output :class})
+              binary-probabilities (nn/predict current-session :binary binary-validation
                                                {:output :probability})
 
               ;; CE uses sparse integer labels and three logits per sample.
               multiclass-network (nn/build current-session [:linear 3]
                                            {:input-shape [2] :name :multiclass})
-              multiclass-result (nn/train! current-session multiclass-network multiclass-data
+              multiclass-result (nn/train! current-session multiclass-network multiclass-training
                                            {:x [:horizontal :vertical] :y :label :loss :ce
                                             :optim [:adam {:lr 0.1}] :epochs 8 :batch 30
-                                            :shuffle? false :validation multiclass-data
+                                            :shuffle? false :validation multiclass-validation
                                             :metrics [:accuracy]})
-              multiclass-probabilities (nn/predict current-session :multiclass multiclass-data
+              multiclass-probabilities (nn/predict current-session :multiclass multiclass-validation
                                                    {:output :probability})
 
               ;; Both feature and target scaling are learned from training rows only.
               regression-network (nn/build current-session [:linear 1]
                                            {:input-shape [1] :name :regression})
-              regression-result (nn/train! current-session regression-network regression-data
+              regression-result (nn/train! current-session regression-network regression-training
                                            {:x [:x] :y :target :standardize [:x :y]
                                             :loss :mse :optim [:adam {:lr 0.1}]
                                             :epochs 8 :batch 32 :shuffle? false
-                                            :validation regression-data :metrics [:mae]})
-              regression-predictions (nn/predict current-session :regression regression-data {})
+                                            :validation regression-validation :metrics [:mae]})
+              regression-predictions (nn/predict current-session :regression regression-validation {})
 
               ;; Keep whole batteries out of training; no window crosses a partition.
               training-batteries (table/query battery-data [:where [:< :battery_id 6]])
@@ -128,14 +141,14 @@
                           :probabilities binary-probabilities)
            :multiclass (assoc multiclass-result :probabilities multiclass-probabilities)
            :regression (assoc regression-result :predictions regression-predictions
-                              :evaluation (nn/evaluate current-session :regression regression-data
+                              :evaluation (nn/evaluate current-session :regression regression-validation
                                                        {:metrics [:mae :mse]}))
            :sequence (assoc sequence-result :predictions sequence-predictions
                             :evaluation (nn/evaluate current-session :battery validation-batteries
                                                      {:metrics [:mae]}))
            :custom custom-result
            :persistence {:before regression-predictions
-                         :after (nn/predict current-session :restored regression-data {})}}))
+                         :after (nn/predict current-session :restored regression-validation {})}}))
       (finally
         (doseq [file (reverse (file-seq (io/file directory)))]
           (io/delete-file file))))))

@@ -1,28 +1,129 @@
 # garun-small
 
-A small JVM Clojure version of the Garun Hiccup DSL. It has two backends:
+**garun-small is a small experiment: a Clojure (JVM) data and deep-learning DSL
+in Hiccup form.** Tables are pure data plans—vectors and maps compiled through
+HoneySQL into SQL executed by DuckDB. Neural networks are Hiccup specs compiled
+into Deep Java Library (DJL) blocks using the PyTorch engine. The experiment's question was
+whether the whole data-to-model workflow could be ordinary Clojure data. In
+practice the Hiccup DSL turned out very readable and easy to write:
 
-- **DuckDB** (plain JDBC) for tables. Garun clauses become HoneySQL query data;
-  HoneySQL renders SQL and bound parameters at execution time.
-- **Deep Java Library 0.36 / PyTorch 2.7.1** for tensors, neural networks,
-  training and typed model inference. CPU is the default; CUDA is opt-in.
+```clojure
+(require '[garun.session :as session]
+         '[garun.table :as table]
+         '[garun.nn :as nn])
 
-A `garun.session` Session centralizes ownership: its DuckDB connection, root tensor
-manager, defaults and registered networks, models, trainers and tables. The DSL names common
-DJL components and accepts native DJL objects for the rest; it does not
-reimplement DJL's entire Java API. Rust, classical estimators (k-means, SVM,
-XGBoost, …) and visualization remain out of scope.
-
-## Build and test
-
-```sh
-clojure -T:build javac   # compile the remaining native DJL bridges
-clojure -M:test          # sessions, DuckDB, blocks, tensors, training, inference, metrics
+;; Supply data/readings.csv with numeric sample_id,x,target columns and
+;; enough rows for nonempty training, validation and test partitions.
+(with-open [current-session (session/open {:seed 7 :device :cpu})]
+  (let [readings (table/query [:csv {:path "data/readings.csv" :header? true}]
+                             [[:select :sample_id :x :target]
+                              [:where [:not-null :target]]])
+        [train validation test]
+        (table/query readings [:split {:fractions [0.7 0.15 0.15]
+                                       :seed 7 :key :sample_id}])
+        network [:sequential [:linear 8] [:relu] [:linear 1]]]
+    (nn/build current-session network {:input-shape [1] :name :regressor})
+    (nn/train! current-session :regressor train
+               {:x [:x] :y :target :standardize [:x :y]
+                :validation validation :loss :mse
+                :optim [:adam {:lr 0.01}] :epochs 25 :batch 128
+                :early-stopping {:patience 5 :restore-best? true}
+                :metrics [:mae] :observe tap>})
+    (nn/evaluate current-session :regressor test {:metrics [:mae :mse]})))
 ```
 
-All dependencies resolve from Maven. The default PyTorch native library comes
-from the `pytorch-native-cpu` linux-x86_64 jar: no native download at CPU runtime.
-The `:cuda` profile instead lets DJL download/cache the pinned CUDA library.
+One **Session** owns the DuckDB connection, tensor memory and named resources
+(tables, networks, models and trainers), and closes them together. Training is
+one `nn/train!` call, including partition-aware sequence windows, training-only
+standardization, early stopping and epoch observation. The example evaluates a
+separate test partition; validation is used to choose when to stop.
+
+This is a small layer, not a replacement engine. The full **DJL** API—blocks,
+training, tensors, model zoo and translators—and the full **DuckDB** SQL
+engine—file formats, windows, joins and more—remain available underneath.
+The DSL names common operations, and DJL-facing APIs accept the corresponding
+native DJL objects wherever specs are accepted as escape hatches. HoneySQL and
+trusted SQL expose DuckDB operations beyond the named table clauses. Rust,
+classical estimators (k-means, SVM, XGBoost, …) and visualization are outside
+this project's scope.
+
+## Why tables instead of a dataframe
+
+A dataframe is essentially a table. Here, a table is a **pure, inspectable
+plan**, not an in-memory object containing the result. Plans compose as data;
+you can inspect them at the REPL, reason about transformations before running
+them, and print the SQL and bound parameters with `(table/->sql plan)`.
+Building or composing a plan does not open a connection or read a file.
+
+That gives you DuckDB's capabilities without a dataframe library dependency:
+
+- A vectorized, columnar SQL engine that reads **CSV, Parquet and JSON directly**.
+- Out-of-core SQL execution for data larger than RAM, subject to DuckDB's
+  operator, memory and temporary-storage limits.
+- Joins, window functions and grouped aggregates instead of host-side
+  dataframe transformations.
+- Seeded, keyed deterministic splits: the same key stays in one partition,
+  including all rows belonging to one battery, customer or other entity.
+  Fractions are hash-bucket proportions, not exact row-count quotas.
+- Materialized session tables that are shared by worker threads, each using
+  its own DuckDB connection and tensor sub-manager.
+- Standardization means and population standard deviations computed
+  **in-engine from training rows only**, then reused for validation and inference.
+
+For file-backed training, selected feature/label data crosses into JVM host
+storage once per prepared dataset as **float32 matrices**, then becomes DJL
+tensors; the epoch loop does not re-extract table rows. This is not zero-copy
+or streaming training: the current table training path eagerly holds matrices,
+sequence windows and tensors in memory. DuckDB's out-of-core preprocessing
+does not imply that an arbitrarily large training dataset fits in tensor
+memory. Explicit calls such as `table/rows`, predictions and metrics also
+return host-side results.
+
+Plans are not a sandbox. `[:duckdb {:query "..."}]` and HoneySQL `:raw` forms
+are **trusted SQL**; do not pass untrusted SQL to them. Host-side matrix
+extraction is float32, so it is not a lossless route for arbitrary numeric
+values or large integer identifiers.
+
+## Status and limits
+
+CPU execution is verified by the test suite and runnable gallery. CPU is the
+default; the opt-in **CUDA profile is unverified**. Dependencies are pinned to
+**DJL 0.36.0 / PyTorch 2.7.1**. Small Java bridge classes address missing,
+inaccessible or defective DJL operations in that pinned stack:
+
+| Bridge | Reason |
+|---|---|
+| [`FnBlock`](java/garun/djl/FnBlock.java) | Exposes protected child initialization/forwarding hooks for Clojure parallel and residual combinations. |
+| [`TransposeConvolution`](java/garun/djl/TransposeConvolution.java) | Implements differentiable transposed convolution because PyTorch JNI has no transposed-convolution entry point. |
+| [`MaskedTransformerEncoder`](java/garun/djl/MaskedTransformerEncoder.java) | Initializes encoder children from the embedding shape, not the optional attention-mask shape. |
+| [`TensorOptimizer`](java/garun/djl/TensorOptimizer.java) | Supplies device-native optimizer updates where the pinned PyTorch optimizer kernels are incomplete. |
+| [`OrderedRecurrent`](java/ai/djl/nn/recurrent/OrderedRecurrent.java) | Fixes biased bidirectional RNN/GRU/LSTM parameter ordering to match PyTorch's native contract. |
+
+## Requirements and quick start
+
+- **Clojure CLI** and **JDK 17+** (JDK 21 is recommended); Java bridges compile
+  with `--release 17`. This is JVM Clojure, not Babashka.
+- The default CPU native dependency targets **Linux x86-64**. Other platforms
+  need a matching PyTorch native artifact instead of the bundled one.
+- Maven access for dependency resolution on the first build/run.
+
+From the repository root:
+
+```sh
+clojure -T:build javac   # compile Java bridges into target/classes
+clojure -M:test          # sessions, DuckDB, blocks, tensors, training, inference, metrics
+clojure -Sdeps '{:paths ["src" "examples" "target/classes"]}' -M -e "(require 'garun.examples.training) (garun.examples.training/run!)"
+```
+
+The gallery uses synthetic data and needs no downloaded dataset. All default
+dependencies resolve from Maven, including the `pytorch-native-cpu`
+Linux x86-64 jar, so CPU startup needs no separate native download. The `:cuda`
+profile instead lets DJL download/cache the pinned CUDA library; see
+[CUDA](#cuda) for device selection and driver requirements.
+
+## License
+
+MIT; see [`LICENSE`](LICENSE).
 
 ## Gallery
 
@@ -37,13 +138,15 @@ small training runs; they need no datasets or extra dependencies:
   MLP, residual, inception, CNN, sequence convolution, convolutional autoencoder,
   GRU, LSTM, bidirectional LSTM, embedding/text classifier, transformer
   classifier, attention, NDArray lambda and custom parallel combination.
-- [Training](examples/garun/examples/training.clj): BCE and CE classification,
-  standardization, battery sequences, early stopping, epoch observers,
-  a custom trainer loop and model persistence.
+- [Training](examples/garun/examples/training.clj): BCE and CE classification
+  and regression with deterministic held-out validation, standardization,
+  battery sequences, early stopping, epoch observers, a custom trainer loop
+  and model persistence.
 
 Each file exposes `(run!)`, returning a plain-data summary, and `-main`,
 printing and returning it. `garun.examples-test` runs all three and checks
-shapes, finite/decreasing losses, keyed partitions and persistence.
+shapes, finite/decreasing losses, disjoint keyed training/validation partitions
+and persistence.
 
 ```sh
 clojure -Sdeps '{:paths ["src" "examples" "target/classes"]}' -M -m garun.examples.tables
@@ -573,8 +676,7 @@ DJL downloads/caches it on first use; a compatible NVIDIA driver is required.
 Start a fresh JVM when changing native profiles. Pass `:device [:gpu 0]` to
 `session/open` (or per call); `:auto` lets the engine choose.
 Explicit unavailable GPU requests fail instead of silently falling back to CPU.
-GPU execution has not been verified in this workspace: the NVIDIA driver
-cannot be contacted.
+The CUDA profile is available, but GPU execution remains unverified.
 
 ## Translators and model loading
 
