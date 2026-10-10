@@ -7,7 +7,7 @@
         ai.djl.pytorch/pytorch-jni {:mvn/version "2.7.1-0.36.0"}
         ai.djl.pytorch/pytorch-native-cpu$linux-x86_64 {:mvn/version "2.7.1"}}
  :aliases
- {:test {:extra-paths ["test"]
+ {:test {:extra-paths ["test" "examples"]
          :main-opts ["-m" "garun.test-runner"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.7"}}
           :ns-default build}

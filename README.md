@@ -24,6 +24,142 @@ All dependencies resolve from Maven. The default PyTorch native library comes
 from the `pytorch-native-cpu` linux-x86_64 jar: no native download at CPU runtime.
 The `:cuda` profile instead lets DJL download/cache the pinned CUDA library.
 
+## Gallery
+
+Copy a spec, change its dimensions, and run it. These namespaces are short,
+top-to-bottom CPU stories with synthetic data, real native predictions and
+small training runs; they need no datasets or extra dependencies:
+
+- [Tables](examples/garun/examples/tables.clj): expressions, HoneySQL CASE,
+  aggregates, running windows, left/semi/anti joins, keyed splits, seeded
+  sampling, named materialization and a temporary parquet round trip.
+- [Networks](examples/garun/examples/networks.clj): **14 runnable specs**:
+  MLP, residual, inception, CNN, sequence convolution, convolutional autoencoder,
+  GRU, LSTM, bidirectional LSTM, embedding/text classifier, transformer
+  classifier, attention, NDArray lambda and custom parallel combination.
+- [Training](examples/garun/examples/training.clj): BCE and CE classification,
+  standardization, battery sequences, early stopping, epoch observers,
+  a custom trainer loop and model persistence.
+
+Each file exposes `(run!)`, returning a plain-data summary, and `-main`,
+printing and returning it. `garun.examples-test` runs all three and checks
+shapes, finite/decreasing losses, keyed partitions and persistence.
+
+```sh
+clojure -Sdeps '{:paths ["src" "examples" "target/classes"]}' -M -m garun.examples.tables
+clojure -Sdeps '{:paths ["src" "examples" "target/classes"]}' -M -m garun.examples.networks
+clojure -Sdeps '{:paths ["src" "examples" "target/classes"]}' -M -m garun.examples.training
+```
+
+For the following snippets, require the DSL and the gallery's synthetic sources:
+
+```clojure
+(require '[garun.session :as session] '[garun.table :as table] '[garun.nn :as nn]
+         '[garun.examples.tables :as tables] '[garun.examples.training :as training])
+```
+
+**1. Expressions, CASE and a running window.** CASE uses native HoneySQL;
+the surrounding clauses use Garun expressions.
+
+```clojure
+(def enriched
+  (table/query tables/orders
+    [[:derive {:gross [:* :amount :quantity]}]
+     [:honeysql {:select [:* [[:case [:>= :gross 60] "large"
+                                    :else "small"] :size]]}]
+     [:derive {:running_total
+               [:cast
+                [:over [:sum :gross] {:partition-by [:customer_id]
+                                     :order-by [:order_id]
+                                     :rows [:unbounded :current]}]
+                :int64]}]
+     [:order-by :order_id]]))
+```
+
+DuckDB's integer `SUM` produces a 128-bit HUGEINT, while parquet has no 128-bit
+integer type. This small-data example explicitly chooses `:int64` for its
+running total before the parquet round trip.
+
+**2. Grouped aggregates are ordinary Hiccup.**
+
+```clojure
+(table/query enriched
+  [[:group-by [:customer_id] {:orders [:count] :revenue [:sum :gross]}]
+   [:order-by [:revenue :desc]]])
+```
+
+**3. Join customers, then keep each customer's orders in one split.**
+Use `:semi` to retain matched orders only, or `:anti` for unmatched orders.
+
+```clojure
+(table/query enriched
+  [[:join tables/customers {:on [:customer_id] :how :left}]
+   [:split {:fractions [0.75 0.25] :seed 7 :key :customer_id}]])
+```
+
+**4. A tabular MLP with batch normalization and dropout.**
+
+```clojure
+[:sequential
+ [:linear 8] [:batchnorm] [:relu] [:dropout {:p 0.2}]
+ [:linear 2]]
+;; :input-shape [4], native batch [2 4] -> [2 2]
+```
+
+**5. Inception-style parallel branches concatenate image channels.**
+
+```clojure
+[:sequential
+ [:parallel {:combine :concat :axis 1}
+  [:sequential [:conv2d {:filters 2 :kernel [1 1]}] [:relu]]
+  [:sequential [:conv2d {:filters 3 :kernel [3 3] :padding [1 1]}] [:relu]]]
+ [:global-avg-pool2d] [:linear 3]]
+;; :input-shape [1 8 8], native batch [2 1 8 8] -> [2 3]
+```
+
+**6. A convolutional autoencoder restores the original image size.**
+
+```clojure
+[:sequential
+ [:conv2d {:filters 2 :kernel [3 3] :stride [2 2] :padding [1 1]}]
+ [:relu]
+ [:conv2d-transpose {:filters 1 :kernel [3 3] :stride [2 2]
+                     :padding [1 1] :output-padding [1 1]}]
+ [:sigmoid]]
+;; :input-shape [1 8 8], native batch [2 1 8 8] -> [2 1 8 8]
+```
+
+**7. Last-timestep sequence regression needs no custom indexing function.**
+
+```clojure
+(def battery-network
+  [:sequential
+   [:gru {:state-size 4 :batch-first? true}]
+   [:index ":, -1"] [:linear 1]])
+;; :input-shape [3 2], native batch [N 3 2] -> [N 1]
+```
+
+**8. Train that GRU on held-out batteries with scaling and early stopping.**
+
+```clojure
+(with-open [current-session (session/open {:seed 7 :device :cpu})]
+  (let [train (table/query training/battery-data [:where [:< :battery_id 6]])
+        validation (table/query training/battery-data [:where [:>= :battery_id 6]])]
+    (nn/build current-session battery-network {:input-shape [3 2] :name :battery})
+    (nn/train! current-session :battery train
+      {:x [:voltage :temperature] :y :remaining_life
+       :sequence {:length 3 :partition-by :battery_id :order-by :cycle}
+       :standardize [:x :y] :validation validation :loss :mse
+       :optim [:adam {:lr 0.05}] :epochs 8 :batch 48 :shuffle? false
+       :early-stopping {:patience 2 :min-delta 0.0001 :restore-best? true}
+       :metrics [:mae]})))
+```
+
+Network specs are values, not model instances. The network gallery shows
+`nn/build` plus an actual native `nn/predict` for every spec, including int64
+embedding inputs. The training gallery uses `:observe tap>` for BCE metrics;
+add a tap at the REPL to inspect epoch and finished events.
+
 ## Namespaces
 
 | Namespace | Surface |
@@ -169,6 +305,14 @@ convolution, masked transformer initialization and tensor-native optimizers
 where the pinned PyTorch backend lacks or misimplements the public operation.
 Transposed convolution retains DJL's weight layout
 `[filters, input-channels/groups, kernel…]`, not PyTorch's ConvTranspose layout.
+
+**Pinned recurrent backend limit:** DJL 0.36 orders biased bidirectional
+RNN/GRU/LSTM parameters differently from PyTorch's native contract. Garun's
+`ai.djl.nn.recurrent.OrderedRecurrent` bridge reorders the existing parameter
+objects once at construction, preserving native gradients and persistence.
+It lives in the DJL package solely to access package-private constructors.
+Bidirectional outputs are checked against independent forward/reversed-time
+unidirectional runs, with multi-layer, layout, state and save/load regressions.
 
 `nn/build` accepts either `:input-shape` (one sample; batch dimension 1 is
 prepended) or `:input-shapes` (full concrete DJL shapes, including multiple

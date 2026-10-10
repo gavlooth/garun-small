@@ -265,6 +265,72 @@
           (is (every? true? (map (fn [^NDArray a ^NDArray b] (.allClose a b 1.0e-6 1.0e-6 false))
                                  outputs restored))))))))
 
+(defn- directional-reference!
+  "Run one direction independently; the reverse direction reads time backwards."
+  [tag options ^NDManager manager ^NDArray input ^Block bidirectional direction time-axis]
+  (let [reverse? (= direction "r")
+        reference-input (if reverse? (nd/flip input time-axis) input)
+        inputs (nd/ndlist [reference-input])
+        ^Block reference (initialize! [tag (assoc options :bidirectional? false :return-state? false)]
+                                      manager inputs)]
+    (doseq [^Parameter parameter (.values (.getDirectParameters reference))]
+      (let [name (str direction (subs (.getName parameter) 1))
+            ^Parameter original (.get (.getDirectParameters bidirectional) name)]
+        (.set (.getArray parameter) (.toFloatArray (.getArray original)))))
+    (let [^NDArray output (.head (.forward reference (ParameterStore. manager false) inputs false))]
+      (if reverse? (nd/flip output time-axis) output))))
+
+(deftest bidirectional-recurrent-values-match-independent-directions
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (doseq [tag [:rnn :gru :lstm]
+            batch-first? [true false]
+            bias? [true false]]
+      (testing (pr-str [tag batch-first? bias?])
+        (with-open [scope (.newSubManager manager)]
+          (let [dimensions (if batch-first? [2 4 3] [4 2 3])
+                input (.create scope (float-array (map #(/ % 20.0) (range 24)))
+                               (Shape. (long-array dimensions)))
+                options {:state-size 2 :batch-first? batch-first? :bidirectional? true :bias? bias?}
+                inputs (nd/ndlist [input])
+                ^Block block (initialize! [tag options] scope inputs)
+                time-axis (if batch-first? 1 0)]
+            ;; Distinct direction weights make an accidental branch swap observable.
+            (doseq [^Parameter parameter (.values (.getDirectParameters block))]
+              (let [base (if (.startsWith (.getName parameter) "l") 0.02 -0.04)]
+                (.set (.getArray parameter)
+                      (float-array (map #(+ base (* 0.002 %))
+                                        (range (.size (.getArray parameter))))))))
+            (let [left (directional-reference! tag options scope input block "l" time-axis)
+                  right (directional-reference! tag options scope input block "r" time-axis)
+                  expected (nd/concat [left right] 2)
+                  ^NDArray actual (.head (.forward block (ParameterStore. scope false) inputs false))]
+              (is (= (assoc dimensions 2 4) (nd/shape actual)))
+              (is (.allClose actual expected 1.0e-6 1.0e-6 false))
+              (is (not (.isReleased input))))))))))
+
+(deftest bidirectional-recurrent-layers-states-gradients-and-serialization
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (doseq [tag [:rnn :gru :lstm]
+            layers [1 2]
+            batch-first? [true false]
+            bias? [true false]]
+      (testing (pr-str [tag layers batch-first? bias?])
+        (with-open [scope (.newSubManager manager)]
+          (let [dimensions (if batch-first? [2 3 2] [3 2 2])
+                spec [tag {:state-size 3 :layers layers :batch-first? batch-first?
+                           :bidirectional? true :bias? bias? :return-state? true}]
+                input (.ones scope (Shape. (long-array dimensions)))
+                inputs (nd/ndlist [input])
+                {:keys [block actual declared gradients]} (exercise-gradients! spec scope inputs)
+                expected (into [(assoc dimensions 2 6)]
+                               (repeat (if (= tag :lstm) 2 1) [(* 2 layers) 2 3]))
+                restored (parameter-roundtrip! spec scope inputs block)]
+            (is (= expected actual declared))
+            (is (= expected (mapv nd/shape restored)))
+            (is (seq gradients))
+            (is (every? #(Double/isFinite (double %)) gradients))
+            (is (some #(not (zero? %)) gradients))))))))
+
 (deftest attention-and-masked-encoder-gradients-shapes-and-persistence
   (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
     (doseq [spec [[:attention {:embedding-size 4 :heads 2 :dropout 0.0}]

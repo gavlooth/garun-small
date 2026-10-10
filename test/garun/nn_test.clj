@@ -138,6 +138,28 @@
       (is (= {:spec composite-spec :predictions predictions}
              (saved-network-predictions! current-session network source [:a :b]))))))
 
+(deftest bidirectional-recurrent-networks-save-and-load-identical-predictions
+  (let [directory (.toFile (Files/createTempDirectory "garun-bidirectional-"
+                                                      (make-array FileAttribute 0)))]
+    (try
+      (with-open [current-session (session/open {:seed 43})]
+        (doseq [tag [:rnn :gru :lstm]]
+          (let [spec [:sequential
+                      [tag {:state-size 2 :layers 2 :bidirectional? true :batch-first? true}]
+                      [:index ":, -1"] [:linear 1]]
+                network (nn/build current-session spec {:input-shape [4 3]})
+                inputs (nd/arange current-session [2 4 3] {:dtype :float32})
+                before (nn/predict current-session network inputs {})
+                _ (nn/save! current-session network directory)
+                restored (nn/load current-session directory)
+                after (nn/predict current-session restored inputs {})]
+            (is (= [[2 1]] (mapv nd/shape before) (mapv nd/shape after)) (name tag))
+            (is (= (mapv nd/to-vector before) (mapv nd/to-vector after)) (name tag))
+            (is (= spec (:spec restored))))))
+      (finally
+        (doseq [^java.io.File file (reverse (file-seq directory))]
+          (.delete file))))))
+
 (deftest direct-combination-output-shapes
   (with-open [current-session (session/open)]
     (doseq [[spec width] [[[:parallel {:combine :add} [:linear 2] [:linear 2]] 2]

@@ -19,7 +19,7 @@
             GhostBatchNorm$Builder LayerNorm]
            [ai.djl.nn.pooling Pool]
            [ai.djl.nn.recurrent GRU GRU$Builder LSTM LSTM$Builder RNN RNN$Builder
-            RNN$Activation RecurrentBlock$BaseBuilder]
+            RNN$Activation RecurrentBlock$BaseBuilder OrderedRecurrent]
            [ai.djl.nn.transformer BertBlock BertBlock$Builder BertNextSentenceBlock
             BertPretrainingBlock IdEmbedding$Builder ScaledDotProductAttentionBlock]
            [ai.djl.modality.nlp DefaultVocabulary Vocabulary]
@@ -336,8 +336,8 @@
              (.setActivation ^RNN$Builder builder
                              (case (get opts :activation :tanh) :tanh RNN$Activation/TANH :relu RNN$Activation/RELU
                                    (invalid :nn/invalid-activation "RNN activation must be :tanh or :relu" {:options opts})))
-             (.build ^RNN$Builder builder))
-      :lstm (let [block (.build ^LSTM$Builder builder)]
+             (OrderedRecurrent/rnn ^RNN$Builder builder))
+      :lstm (let [block (OrderedRecurrent/lstm ^LSTM$Builder builder)]
               (if return-state?
                 (corrected-output-shapes!
                  block
@@ -347,7 +347,7 @@
                                         (aget ^"[Lai.djl.ndarray.types.Shape;" shapes 1)
                                         (aget ^"[Lai.djl.ndarray.types.Shape;" shapes 1)]))))
                 block))
-      :gru (.build ^GRU$Builder builder))))
+      :gru (OrderedRecurrent/gru ^GRU$Builder builder))))
 
 (defn- attention! [tag args]
   (let [encoder? (= tag :transformer-encoder)
