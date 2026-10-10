@@ -6,7 +6,7 @@
             [garun.training.losses :as losses]
             [garun.training.optimizers :as optimizers])
   (:import [ai.djl Device]
-           [ai.djl.ndarray NDList]
+           [ai.djl.ndarray NDArray NDList]
            [ai.djl.nn Parameter$Type]
            [ai.djl.training DefaultTrainingConfig TrainingConfig]
            [ai.djl.training.evaluator Evaluator]
@@ -156,7 +156,7 @@
   and returns per-sequence values (DJL semantics). :quantile is DJL's twice-pinball
   loss, so quantile .5 equals MAE. :composite sums :losses on the same inputs.
   :l1-decay/:l2-decay/:elastic-net use caller-owned :parameters NDList."
-  [spec]
+  ^Loss [spec]
   (if (instance? Loss spec)
     spec
     (let [[tag raw] (component-spec spec :nn/invalid-loss :loss)
@@ -237,7 +237,7 @@
   learning-rate API and rejects :lr. Common options: :weight-decay, :clip-grad,
   :rescale-grad, :begin-update. Family options: :momentum, :beta1/:beta2,
   :rho, :epsilon, :centered? as supported by the corresponding DJL optimizer."
-  [spec]
+  ^Optimizer [spec]
   (if (instance? Optimizer spec)
     spec
     (let [_ (when-not (and (vector? spec) (= 2 (count spec)))
@@ -270,11 +270,24 @@
       (when (contains? opts :begin-update) (.optBeginNumUpdate builder (int (:begin-update opts))))
       (optimizers/build tag opts rate builder))))
 
+(defn update!
+  "Apply a stateful Optimizer (from optimizer) to one parameter in place and
+  return weight. parameter-identifier keys the optimizer's per-parameter state
+  and update count, so reuse the same identifier and Optimizer across steps.
+  Runs device-natively on the weight's device; gradient is not closed."
+  ^NDArray [optimizer parameter-identifier weight gradient]
+  (when-not (instance? Optimizer optimizer)
+    (invalid :nn/invalid-optimizer
+             "update! needs a stateful Optimizer instance; build it once with optimizer"
+             {:optimizer optimizer}))
+  (.update ^Optimizer optimizer ^String parameter-identifier ^NDArray weight ^NDArray gradient)
+  weight)
+
 (defn initializer
   "Return a native Initializer, :zeros/:ones/:xavier, or [family options].
   :constant {:value}; :normal/:truncated-normal {:sigma}; :uniform {:scale};
   :xavier {:random :uniform|:gaussian, :factor :avg|:in|:out, :magnitude}."
-  [spec]
+  ^Initializer [spec]
   (if (instance? Initializer spec)
     spec
     (let [[tag raw] (component-spec spec :nn/invalid-initializer :initializer)
@@ -318,7 +331,7 @@
   ExecutorService). Explicit listeners replace defaults; [] disables them.
   Without explicit devices DJL selects its default devices. No executor is
   created implicitly. Native components and configs are not EDN serializable."
-  [spec]
+  ^TrainingConfig [spec]
   (if (instance? TrainingConfig spec)
     spec
     (let [opts (options spec #{:loss :optim :device :devices :listeners :evaluators

@@ -279,6 +279,10 @@ controls include momentum, beta values, rho, epsilon and centered RMSProp.
 no learning-rate option. AdamW uses decoupled decay. Rescaling and symmetric
 gradient clipping precede other optimizers' coupled L2 decay.
 Create fresh stateful optimizers/trackers for independent training runs.
+All seven run as tensor operations on the weight's device (no host round trip).
+For hand-written steps, `(training/update! optimizer "w" weight gradient)` applies
+one update in place without caller type hints; reuse the same optimizer and
+identifier so momentum/moment state carries across steps.
 
 Constructors are used by `nn/train!` and `garun.training/config`, which also
 accepts listeners, evaluators, initializers, devices and a caller-owned

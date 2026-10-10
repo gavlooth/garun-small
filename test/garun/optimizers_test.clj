@@ -285,3 +285,24 @@
         (is (.hasGradient weight))
         (with-open [^NDArray gradient (.getGradient weight)]
           (is (near? 0 (first (.toFloatArray gradient)))))))))
+
+(deftest update-applies-state-across-steps-without-caller-hints
+  (with-open [current-session (session/open)]
+    (let [optimizer (training/optimizer [:sgd {:lr 0.1 :momentum 0.5}])
+          weight (tensor/array current-session [1.0 2.0] {:dtype :float32})
+          gradient (tensor/array current-session [1.0 1.0] {:dtype :float32})
+          warnings (java.io.StringWriter.)]
+      (binding [*err* (java.io.PrintWriter. warnings)
+                *warn-on-reflection* true
+                *ns* (the-ns 'garun.optimizers-test)]
+        (eval '(fn [optimizer weight gradient]
+                 (training/update! optimizer "w" weight gradient))))
+      (is (= "" (str warnings)))
+      (is (identical? weight (training/update! optimizer "w" weight gradient)))
+      (is (every? true? (map near? [0.9 1.9] (.toFloatArray ^NDArray weight))))
+      ;; Momentum state is keyed by identifier: the second step is 0.1 + 0.5 * 0.1.
+      (training/update! optimizer "w" weight gradient)
+      (is (every? true? (map near? [0.75 1.75] (.toFloatArray ^NDArray weight))))
+      (is (= :nn/invalid-optimizer
+             (:error (ex-data (try (training/update! [:sgd {}] "w" weight gradient)
+                                   (catch clojure.lang.ExceptionInfo error error)))))))))
