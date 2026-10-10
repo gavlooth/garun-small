@@ -33,6 +33,7 @@ The `:cuda` profile instead lets DJL download/cache the pinned CUDA library.
 | `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `row-count`, `matrix`, `matrices`, `materialize!`, `write-csv!`, `write-parquet!` |
 | `garun.blocks` | `compile-block`, `serializable-spec?`; Hiccup or native DJL `Block` |
 | `garun.tensor` | `device`, `dtype`, `shape`, `array`, `ndlist` |
+| `garun.ndarray` (`nd`) | Reflection-free NDArray math, indexing, reductions, shape transforms and NDList access |
 | `garun.training` | `loss`, `optimizer`, `tracker`, `initializer`, `config`; specs or native DJL components |
 | `garun.nn` | `build`, `train!`, `trainer`, `epoch!`, `validate`, `restore-best!`, `evaluate`, `predict`, `predict-with`, `save!`, `load` |
 | `garun.model` | `criteria`, `load!`, `predict`, `batch-predict`; native translators |
@@ -137,7 +138,7 @@ by DuckDB; a later Garun `:select` can explicitly name the output columns.
 | Embeddings | `:embedding`, `:word-embedding`, `:constant-embedding` |
 | Recurrent | `:rnn`, `:lstm`, `:gru` |
 | Attention | `:attention`, `:transformer-encoder`, `:bert`, `:bert-pretraining`, `:bert-next-sentence` |
-| Tensor transforms | `:reshape`, `:transpose`, `:softmax`, `:log-softmax`, `:expand-dims`, `:squeeze` |
+| Tensor transforms | `:reshape`, `:transpose`, `:index`, `:softmax`, `:log-softmax`, `:expand-dims`, `:squeeze` |
 
 The `/1d/2d/3d` notation above abbreviates three separate tags.
 Options are closed maps: misspelled or unsupported keys fail rather than vanish.
@@ -148,6 +149,12 @@ The per-tag builders in `src/garun/blocks.clj` define the full option contracts.
   dilation, groups and bias. Transposed convolutions also accept output padding.
 - Recurrent blocks require `:state-size`; attention requires `:embedding-size`
   and `:heads`; transformer encoders also require `:hidden-size`.
+- `[:index "<DJL NDIndex string>"]` indexes one input tensor using DJL's grammar
+  unchanged: slices, steps, negative indices, `...` and `:`. The argument must
+  be a nonempty string without NUL. Output shapes are inferred automatically.
+  `[:index ":, -1"]` selects the last time step, mapping `[N,T,H]` to `[N,H]`;
+  `[:index ":, ::2, :"]` strides over time, and `[:index "..., 0"]` drops the
+  last axis by selecting its first entry. These specs serialize without `:spec`.
 - `:parallel` runs every child on the same input. `:skip` combines the inner
   result with the original input. Both accept `{:combine :add}` or
   `{:combine :concat :axis -1}`, or a combining function with an optional
@@ -182,7 +189,7 @@ remaining-useful-life GRU, from CSV to evaluated model:
         [train validation test] (table/query batteries [[:split {:fractions [0.7 0.15 0.15]
                                                                  :seed 2026 :key :battery_id}]])]
     (nn/build current-session [:sequential [:gru {:state-size 24 :batch-first? true}]
-                                           [:last-step]
+                                           [:index ":, -1"]
                                            [:linear 1]]
               {:input-shape [30 7] :name :gru})
     (nn/train! current-session :gru train
@@ -277,16 +284,52 @@ Constructors are used by `nn/train!` and `garun.training/config`, which also
 accepts listeners, evaluators, initializers, devices and a caller-owned
 executor. Explicit listeners replace the defaults.
 
+## NDArray operations without type hints
+
+Require `[garun.ndarray :as nd]` for Clojure functions over DJL arrays and
+lists. User lambdas, functional losses and metrics need no Java type hints or
+reflective method calls:
+
+```clojure
+(require '[garun.ndarray :as nd])
+
+[:lambda {:singleton? true} (fn [array] (nd/get array ":, -1"))]
+[:lambda (fn [arrays] (nd/ndlist (mapv #(nd/mul % 2) arrays)))]
+
+;; A functional :loss receives labels and predictions as NDLists.
+(fn [labels predictions]
+  (nd/mean (nd/square (nd/sub (nd/singleton predictions)
+                             (nd/singleton labels)))))
+```
+
+Arithmetic and comparisons accept either another NDArray or a number.
+`nd/sum`, `nd/mean`, `nd/max`, `nd/min` and `nd/prod` take optional axes
+(a vector or `int-array`) and `keep-dims?`, e.g. `(nd/sum array [1] true)`.
+`nd/argmax` and `nd/argmin` follow DJL's one-axis limit; omitted/nil axes
+returns a flat index, and `keep-dims?` also works. Shape transforms use
+dimension/axis vectors, `nd/shape` returns a vector, and `nd/concat`/`nd/stack`
+accept a vector of arrays plus an optional axis. `nd/softmax` and
+`nd/log-softmax` require an axis.
+
+`nd/to-vector` copies flat numeric values to the host without routing int64
+through floating point; boolean values become 1/0. Use it at output or metrics
+boundaries, not inside differentiable tensor computations. `nd/to-type` resolves
+dtype keywords through `tensor/dtype`; `nd/duplicate` explicitly copies an array.
+All operations keep DJL's native gradients and manager ownership. `nd/ndlist`
+wraps existing arrays without copying them; closing that list closes its
+elements. In contrast, `tensor/ndlist` constructs independently owned copies.
+
 ## Tensors and device placement
 
 DuckDB remains the ingestion/transformation boundary. `table/matrix` returns
 row-major float32 host storage; `table/matrices` extracts multiple
 column groups from one query. Construct DJL arrays once, then keep matrix
-arithmetic and training on native arrays. Use DJL's `NDArray` methods directly;
-there is no duplicate tensor-operation DSL.
+arithmetic and training on native arrays. `garun.ndarray` supplies type-hinted
+functions over DJL operations; native methods remain available for the rest.
 
 ```clojure
-(require '[garun.session :as session] '[garun.tensor :as tensor] '[garun.nn :as nn])
+(require '[garun.session :as session] '[garun.tensor :as tensor]
+         '[garun.ndarray :as nd] '[garun.nn :as nn])
 
 (with-open [current-session (session/open {:device :cpu})]
   (let [network (nn/build current-session [:sequential
@@ -295,7 +338,7 @@ there is no duplicate tensor-operation DSL.
                                            [:linear 1]]
                           {:input-shape [1 8 8]})
         images (tensor/array current-session (float-array (repeat 128 0.5)) {:shape [2 1 8 8]})]
-    (.toFloatArray (.singletonOrThrow (nn/predict current-session network images {})))))
+    (nd/to-vector (nd/singleton (nn/predict current-session network images {})))))
 ```
 
 `tensor/array` and `tensor/ndlist` take a context or an `NDManager` as owner.

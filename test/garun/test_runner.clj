@@ -7,6 +7,7 @@
             [garun.metrics-test]
             [garun.blocks-test]
             [garun.tensor-test]
+            [garun.ndarray-test]
             [garun.training-test]
             [garun.model-test]
             [garun.losses-test]
@@ -23,6 +24,7 @@
                                              'garun.metrics-test
                                              'garun.blocks-test
                                              'garun.tensor-test
+                                             'garun.ndarray-test
                                              'garun.training-test
                                              'garun.model-test
                                              'garun.losses-test

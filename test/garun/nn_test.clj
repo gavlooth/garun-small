@@ -7,6 +7,7 @@
             [clojure.test :refer [deftest is testing]]
             [garun.blocks :as blocks]
             [garun.nn :as nn]
+            [garun.ndarray :as nd]
             [garun.nn.examples :as examples]
             [garun.session :as session]
             [garun.table :as table]
@@ -337,11 +338,9 @@
       (is (= (mapv double (range 12)) (vec (.toDoubleArray input)))))))
 
 (deftest multiple-native-inputs-and-outputs
-  (let [spec [:lambda (fn [^NDList inputs]
-                        (let [^NDArray left (.get inputs (int 0))
-                              ^NDArray right (.get inputs (int 1))]
-                          (NDList. ^"[Lai.djl.ndarray.NDArray;"
-                           (into-array NDArray [(.add left right) (.sub left right)]))))]]
+  (let [spec [:lambda (fn [inputs]
+                        (let [[array other] inputs]
+                          (nd/ndlist [(nd/add array other) (nd/sub array other)])))]]
     (with-open [current-session (session/open)]
       (let [network (nn/build current-session spec {:input-shapes [[1 2] [1 2]]})
             ^NDArray left (tensor/array current-session [[1 2] [3 4]] {:dtype :float32})
@@ -614,7 +613,7 @@
       (with-open [current-session (session/open {:seed 2026})]
         (let [source (sequence-table 0.0)
               validation (sequence-table 0.2)
-              network (nn/build current-session [:sequential [:last-step] [:linear 1]]
+              network (nn/build current-session [:sequential [:index ":, -1"] [:linear 1]]
                                 {:input-shape [3 1] :name :sequence})
               events (ConcurrentLinkedQueue.)
               result (nn/train! current-session :sequence source
@@ -803,9 +802,9 @@
   (with-open [current-session (session/open)]
     (let [source (regression-table)
           network (nn/build current-session [:linear 1] {:input-shape [1]})
-          functional-loss (fn [^NDList labels ^NDList predictions]
-                            (.mean (.square (.sub (.singletonOrThrow predictions)
-                                                  (.singletonOrThrow labels)))))
+          functional-loss (fn [labels predictions]
+                            (nd/mean (nd/square (nd/sub (nd/singleton predictions)
+                                                        (nd/singleton labels)))))
           result (nn/train! current-session network source
                             {:x [:x] :y :y :epochs 30 :batch 41 :validation source
                              :loss functional-loss :optim [:adam {:lr 0.02}]
@@ -849,7 +848,7 @@
   (with-open [current-session (session/open {:seed 2026})]
     (let [network (nn/build current-session
                             [:sequential [:gru {:state-size 4 :batch-first? true}]
-                             [:last-step] [:linear 1]]
+                             [:index ":, -1"] [:linear 1]]
                             {:input-shape [3 1] :name :battery-gru})
           source (sequence-table 0.0)
           validation (sequence-table 0.2)

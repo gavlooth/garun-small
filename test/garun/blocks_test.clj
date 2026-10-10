@@ -3,6 +3,7 @@
             [garun.context :as context]
             [garun.blocks :as blocks]
             [garun.nn :as nn]
+            [garun.ndarray :as nd]
             [garun.session :as session])
   (:import [ai.djl Device]
            [ai.djl.ndarray NDArray NDList NDManager]
@@ -338,9 +339,8 @@
   (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
     (let [native (-> (Linear/builder) (.setUnits (long 2)) .build)
           factory (fn [] (-> (Linear/builder) (.setUnits (long 2)) .build))
-          twice (fn [^NDList input]
-                  (NDList. ^"[Lai.djl.ndarray.NDArray;"
-                   (into-array NDArray (map (fn [^NDArray x] (.mul x (Float/valueOf (float 2)))) input))))
+          twice (fn [arrays]
+                  (nd/ndlist (mapv #(nd/mul % 2) arrays)))
           spec [:sequential [:block native] [:lambda twice]]
           inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [(.ones manager (Shape. (long-array [2 3])))]))
           result (exercise-gradients! spec manager inputs)
@@ -359,7 +359,7 @@
     (let [input (.create manager (float-array [1 2 3 4]) (Shape. (long-array [2 2])))
           inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
           ^Block block (initialize! [:lambda {:singleton? true :name "square"}
-                                     (fn [^NDArray x] (.square x))] manager inputs)
+                                     (fn [array] (nd/square array))] manager inputs)
           ^NDArray output (.head (.forward block (ParameterStore. manager false) inputs false))]
       (is (= [1.0 4.0 9.0 16.0] (vec (.toFloatArray output))))
       (is (= [1.0 2.0 3.0 4.0] (vec (.toFloatArray input)))))))
@@ -459,84 +459,87 @@
       (is (every? #(< (Math/abs (- 1.0 (reduce + %))) 1.0e-6) (partition 2 values)))
       (is (blocks/serializable-spec? spec)))))
 
-(deftest last-step-selects-the-last-entry-and-only-removes-its-axis
+(deftest index-supports-djl-grammar-and-infers-output-shapes
   (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
     (let [input (.create manager (float-array (range 24)) (Shape. (long-array [2 3 4])))
           inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))]
-      (doseq [[spec expected-shape expected-values]
-              [[[:last-step] [2 4] [8.0 9.0 10.0 11.0 20.0 21.0 22.0 23.0]]
-               [[:last-step {:axis 1}] [2 4] [8.0 9.0 10.0 11.0 20.0 21.0 22.0 23.0]]
-               [[:last-step {:axis -2}] [2 4] [8.0 9.0 10.0 11.0 20.0 21.0 22.0 23.0]]
-               [[:last-step {:axis 0}] [3 4] (mapv double (range 12 24))]
-               [[:last-step {:axis 2}] [2 3] [3.0 7.0 11.0 15.0 19.0 23.0]]
-               [[:last-step {:axis -1}] [2 3] [3.0 7.0 11.0 15.0 19.0 23.0]]]]
-        (testing (pr-str spec)
-          (let [^Block block (initialize! spec manager inputs)
+      (doseq [[index expected-shape expected-values]
+              [[":, -1" [2 4] [8.0 9.0 10.0 11.0 20.0 21.0 22.0 23.0]]
+               [":, ::2, :" [2 2 4] [0.0 1.0 2.0 3.0 8.0 9.0 10.0 11.0
+                                     12.0 13.0 14.0 15.0 20.0 21.0 22.0 23.0]]
+               ["..., 0" [2 3] [0.0 4.0 8.0 12.0 16.0 20.0]]
+               [":, 1:3, 1:4:2" [2 2 2] [5.0 7.0 9.0 11.0 17.0 19.0 21.0 23.0]]
+               ["-1" [3 4] (mapv double (range 12 24))]
+               [":" [2 3 4] (mapv double (range 24))]]]
+        (testing index
+          (let [spec [:index index]
+                ^Block block (blocks/compile-block spec)
+                declared (shape-vectors (.getOutputShapes block (.getShapes inputs)))
+                _ (.initialize block manager DataType/FLOAT32 (.getShapes inputs))
                 ^NDList output (.forward block (ParameterStore. manager false) inputs false)]
-            (is (= [expected-shape] (shape-vectors (.getShapes output))
+            (is (= [expected-shape] declared (shape-vectors (.getShapes output))
                    (shape-vectors (.getOutputShapes block (.getShapes inputs)))))
             (is (= expected-values (vec (.toFloatArray (.singletonOrThrow output)))))
             (is (blocks/serializable-spec? spec))
             (is (not (.isReleased input)))))))
     (let [input (.create manager (float-array [3 7]) (Shape. (long-array [2 1 1])))
           inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
-          ^Block block (initialize! [:last-step] manager inputs)
+          ^Block block (initialize! [:index ":, -1"] manager inputs)
           ^NDList output (.forward block (ParameterStore. manager false) inputs false)]
-      (is (= [[2 1]] (shape-vectors (.getShapes output))))
+      (is (= [[2 1]] (shape-vectors (.getShapes output))
+             (shape-vectors (.getOutputShapes block (.getShapes inputs)))))
       (is (= [3.0 7.0] (vec (.toFloatArray (.singletonOrThrow output))))))))
 
-(deftest last-step-backpropagates-only-through-the-selected-entry
+(deftest index-backpropagates-only-through-selected-entries
   (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
-    (let [input (.create manager (float-array (range 12)) (Shape. (long-array [2 3 2])))
-          _ (.setRequiresGradient input true)
-          inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
-          ^Block block (initialize! [:last-step] manager inputs)]
-      (with-open [^GradientCollector collector (.newGradientCollector (.getEngine manager))]
-        (let [^NDList output (.forward block (ParameterStore. manager false) inputs true)]
-          (.backward collector (.sum (.singletonOrThrow output)))))
-      (is (= [0.0 0.0 0.0 0.0 1.0 1.0 0.0 0.0 0.0 0.0 1.0 1.0]
-             (vec (.toFloatArray (.getGradient input)))))
-      (is (not (.isReleased input))))))
+    (doseq [[index expected-gradient]
+            [[":, -1" [0.0 0.0 0.0 0.0 1.0 1.0 0.0 0.0 0.0 0.0 1.0 1.0]]
+             [":, ::2, :" [1.0 1.0 0.0 0.0 1.0 1.0 1.0 1.0 0.0 0.0 1.0 1.0]]
+             ["..., 0" [1.0 0.0 1.0 0.0 1.0 0.0 1.0 0.0 1.0 0.0 1.0 0.0]]]]
+      (testing index
+        (with-open [scope (.newSubManager manager)]
+          (let [input (.create scope (float-array (range 12)) (Shape. (long-array [2 3 2])))
+                _ (.setRequiresGradient input true)
+                inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+                ^Block block (initialize! [:index index] scope inputs)]
+            (with-open [^GradientCollector collector (.newGradientCollector (.getEngine scope))]
+              (let [^NDList output (.forward block (ParameterStore. scope false) inputs true)]
+                (.backward collector (.sum (.singletonOrThrow output)))))
+            (is (= expected-gradient (vec (.toFloatArray (.getGradient input)))))
+            (is (not (.isReleased input)))))))))
 
-(deftest last-step-rejects-invalid-options-and-unselectable-axes
-  (doseq [[spec expected-error]
-          [[[:last-step {:axis nil}] :nn/invalid-spec]
-           [[:last-step {:axis :time}] :nn/invalid-spec]
-           [[:last-step {:axis 1.5}] :nn/invalid-spec]
-           [[:last-step {:axis (inc (long Integer/MAX_VALUE))}] :nn/invalid-spec]
-           [[:last-step {:axis (dec (long Integer/MIN_VALUE))}] :nn/invalid-spec]
-           [[:last-step {:axis 1 :typo true}] :nn/unknown-option]
-           [[:last-step nil] :nn/invalid-options]
-           [[:last-step {} {}] :nn/invalid-spec]]]
-    (is (= expected-error (error-key #(blocks/compile-block spec))) (pr-str spec)))
-  (doseq [[spec dimensions]
-          [[[:last-step {:axis 3}] [2 3 4]]
-           [[:last-step {:axis -4}] [2 3 4]]
-           [[:last-step] [2]]
-           [[:last-step] [2 0 4]]
-           [[:last-step {:axis 0}] []]]]
-    (let [^Block block (blocks/compile-block spec)]
-      (is (= :nn/invalid-spec
-             (error-key #(.getOutputShapes block (into-array Shape [(Shape. (long-array dimensions))]))))
-          (pr-str [spec dimensions])))))
+(deftest index-rejects-invalid-specifications-and-nonsingleton-inputs
+  (doseq [spec [[:index] [:index nil] [:index :time] [:index 1] [:index 1.5]
+                [:index true] [:index \:] [:index {}] [:index [":, -1"]]
+                [:index (StringBuilder. ":, -1")] [:index ""]
+                [:index "\u0000"] [:index ":,\u0000-1"]
+                [:index ":" nil] [:index ":" ":"]]]
+    (is (= :nn/invalid-spec (error-key #(blocks/compile-block spec))) (pr-str spec)))
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (doseq [input-count [0 2]]
+      (let [inputs (NDList. ^java.util.Collection
+                    (vec (repeat input-count (.ones manager (Shape. (long-array [2 3 4]))))))
+            ^Block block (blocks/compile-block [:index ":, -1"])]
+        (is (thrown? IndexOutOfBoundsException (.getOutputShapes block (.getShapes inputs))))
+        (is (thrown? IndexOutOfBoundsException
+                     (.forward block (ParameterStore. manager false) inputs false)))))))
 
-(deftest last-step-network-spec-and-parameters-survive-save-and-load
-  (let [directory (.toFile (Files/createTempDirectory "garun-last-step-" (make-array FileAttribute 0)))]
+(deftest index-network-spec-and-parameters-survive-save-and-load
+  (let [directory (.toFile (Files/createTempDirectory "garun-index-" (make-array FileAttribute 0)))]
     (try
       (with-open [current-session (session/open)]
         (let [^NDManager manager (context/manager current-session)
               input (.create manager (float-array (range 24)) (Shape. (long-array [2 3 4])))
-              inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))]
-          (doseq [last-step-spec [[:last-step] [:last-step {:axis 1}]]]
-            (let [spec [:sequential last-step-spec [:linear 2]]
-                  network (nn/build current-session spec {:input-shape [3 4]})]
-              (nn/save! current-session network directory)
-              (let [restored (nn/load current-session directory)]
-                (with-open [^NDList before (nn/predict current-session network inputs {})
-                            ^NDList after (nn/predict current-session restored inputs {})]
-                  (is (= spec (:spec restored)))
-                  (is (= [[2 2]] (shape-vectors (.getShapes before)) (shape-vectors (.getShapes after))))
-                  (is (.allClose (.head before) (.head after) 1.0e-6 1.0e-6 false))))))
+              inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+              spec [:sequential [:index ":, -1"] [:linear 2]]
+              network (nn/build current-session spec {:input-shape [3 4]})]
+          (nn/save! current-session network directory)
+          (let [restored (nn/load current-session directory)]
+            (with-open [^NDList before (nn/predict current-session network inputs {})
+                        ^NDList after (nn/predict current-session restored inputs {})]
+              (is (= spec (:spec restored)))
+              (is (= [[2 2]] (shape-vectors (.getShapes before)) (shape-vectors (.getShapes after))))
+              (is (.allClose (.head before) (.head after) 1.0e-6 1.0e-6 false))))
           (is (not (.isReleased input)))))
       (finally
         (doseq [^File file (reverse (file-seq directory))] (.delete file))))))
@@ -555,7 +558,7 @@
       (with-open [current-session (session/open)]
         (let [network (nn/build current-session
                                 [:lambda {:singleton? true}
-                                 (fn [^NDArray input] (.mul input (Float/valueOf (float 2))))]
+                                 (fn [array] (nd/mul array 2))]
                                 {:input-shape [2]})]
           (is (some? (error-key #(nn/save! current-session network directory))))
           (is (empty? (.listFiles ^File directory)))))

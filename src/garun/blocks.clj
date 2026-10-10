@@ -6,10 +6,9 @@
   Custom combinations receive child NDLists and the original NDList. Their shape
   must be value-independent; :shape-fn can describe dtype/value-sensitive outputs
   without allocating probe tensors. Caller functions must preserve input ownership.
-  [:last-step] selects the last entry on axis 1 without retaining that dimension;
-  {:axis integer} selects another axis, including negative axes counted from the end."
+  [:index \"DJL NDIndex string\"] borrows a singleton input and applies DJL indexing,
+  including slices, steps, negative indices and ellipses, without rewriting the string."
   (:import [ai.djl.ndarray NDArray NDArrays NDList]
-           [ai.djl.ndarray.index NDIndex]
            [ai.djl.ndarray.types Shape SparseFormat]
            [ai.djl.nn Activation Block Blocks LambdaBlock SequentialBlock]
            [ai.djl.nn.convolutional Conv1d Conv1d$Builder Conv2d Conv2d$Builder
@@ -420,7 +419,7 @@
 (defn- transform! [tag arguments]
   (let [options (one-options arguments
                              (case tag :reshape #{:shape} :transpose #{:axes}
-                                   (:softmax :log-softmax :expand-dims :squeeze :last-step) #{:axis})
+                                   (:softmax :log-softmax :expand-dims :squeeze) #{:axis})
                              tag)]
     (case tag
       :reshape
@@ -440,26 +439,6 @@
                          {:options options}))
             permutation (int-array axes)]
         (LambdaBlock/singleton (sam (fn [^NDArray input] (.transpose input permutation))) "transpose"))
-      :last-step
-      (let [axis (get options :axis 1)
-            _ (when-not (and (integer? axis) (<= Integer/MIN_VALUE axis Integer/MAX_VALUE))
-                (invalid :nn/invalid-spec "Last-step :axis must be an int32 integer"
-                         {:tag tag :options options}))]
-        (LambdaBlock/singleton
-         (sam (fn [^NDArray input]
-                (let [^Shape shape (.getShape input)
-                      rank (.dimension shape)
-                      dimension (if (neg? axis) (+ rank axis) axis)]
-                  (when-not (< -1 dimension rank)
-                    (invalid :nn/invalid-spec "Last-step :axis is outside the input rank"
-                             {:tag tag :axis axis :shape (vec (.getShape shape))}))
-                  (when-not (pos? (.get shape (int dimension)))
-                    (invalid :nn/invalid-spec "Last-step requires a nonempty selected axis"
-                             {:tag tag :axis axis :shape (vec (.getShape shape))}))
-                  (.get input (-> (NDIndex.)
-                                  (.addAllDim (int dimension))
-                                  (.addIndices (long-array [-1])))))))
-         "last-step"))
       (:softmax :log-softmax :expand-dims :squeeze)
       (let [axis (get options :axis -1)
             _ (when-not (integer? axis)
@@ -472,6 +451,17 @@
                 :log-softmax (fn [^NDArray input] (.logSoftmax input dimension))
                 :expand-dims (fn [^NDArray input] (.expandDims input dimension))
                 :squeeze (fn [^NDArray input] (.squeeze input dimension)))) (name tag))))))
+
+(defn- index! [arguments]
+  (let [^String index (first arguments)
+        _ (when-not (and (= 1 (count arguments)) (string? index) (seq index)
+                         (neg? (.indexOf index (int 0))))
+            (invalid :nn/invalid-spec "Index requires one nonempty string without NUL"
+                     {:tag :index :args arguments}))
+        parameters (object-array 0)]
+    ;; DJL 0.36 LambdaBlock infers shapes by evaluating the lambda on managed zeros.
+    (LambdaBlock/singleton
+     (sam (fn [^NDArray input] (.get input index parameters))) "index")))
 
 (defn- native! [tag args]
   (case tag
@@ -512,14 +502,14 @@
     :max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d
     :batchnorm :layernorm :ghost-batchnorm :embedding :word-embedding
     :rnn :lstm :gru :attention :transformer-encoder :bert :bert-pretraining
-    :reshape :transpose :softmax :log-softmax :expand-dims :squeeze :last-step :leaky-relu :elu :swish})
+    :reshape :transpose :index :softmax :log-softmax :expand-dims :squeeze :leaky-relu :elu :swish})
 
 (defn compile-block
   "Compile Hiccup/native Block into a real DJL Block. No model/manager is created.
   :factory is invoked on each compilation and must return a fresh Block when used
   by distinct owners. Pool/convolution spatial vectors exclude batch/channels;
-  reshape/transpose vectors describe the full tensor, including batch. Last-step
-  defaults to axis 1, removes only the selected dimension, and borrows its input."
+  reshape/transpose vectors describe the full tensor, including batch. Index uses
+  DJL's NDIndex string grammar unchanged and borrows its singleton input."
   ^Block [spec]
   (if (instance? Block spec)
     spec
@@ -556,7 +546,7 @@
           (:attention :transformer-encoder) (attention! tag arguments)
           (:bert :bert-pretraining) (bert! tag arguments)
           :bert-next-sentence (BertNextSentenceBlock.)
-          :last-step (transform! tag (if (seq arguments) arguments [{}]))
+          :index (index! arguments)
           (:reshape :transpose :softmax :log-softmax :expand-dims :squeeze) (transform! tag arguments)
           (:leaky-relu :elu :swish)
           (let [key (if (= tag :swish) :beta :alpha)

@@ -6,7 +6,7 @@
   explicitly; session contexts own their managers. Inputs are borrowed only
   during construction, never attached, closed, or mutated. Closing a result
   NDList closes its elements, not its manager.
-  Use native NDArray methods directly for general tensor operations."
+  Use garun.ndarray functions or native NDArray methods for tensor operations."
   (:require [clojure.string :as str]
             [garun.context :as context])
   (:import [ai.djl Device]
