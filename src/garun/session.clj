@@ -197,7 +197,7 @@
     (instance? Session value)
     (let [^Session current-session value
           ^Defaults native-defaults (.defaults current-session)]
-      {:id (.id current-session)
+      {:identifier (.identifier current-session)
        :status (if (.isClosed current-session) :closed :open)
        :database (.-database native-defaults)
        :device (device-data (.-device native-defaults))
@@ -211,13 +211,13 @@
     (instance? Worker value)
     (let [^Worker current-worker value
           ^Session current-session (.session current-worker)]
-      {:session-id (.id current-session)
+      {:session-identifier (.identifier current-session)
        :status (if (or (.isClosed current-worker) (.isClosed current-session)) :closed :open)})
 
     (instance? Resource value)
     (let [^Resource current-resource value
           kind (keyword (string/lower-case (.name (.-kind current-resource))))]
-      (merge {:id (.-id current-resource)
+      (merge {:identifier (.-identifier current-resource)
               :name (.-name current-resource)
               :kind kind
               :owned? (.-owned current-resource)

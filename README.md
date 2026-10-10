@@ -7,8 +7,8 @@ A small JVM Clojure version of the Garun Hiccup DSL. It has two backends:
 - **Deep Java Library 0.36 / PyTorch 2.7.1** for tensors, neural networks,
   training and typed model inference. CPU is the default; CUDA is opt-in.
 
-One `garun.session` object owns all state: the DuckDB connection, tensor memory,
-defaults and named networks, models, trainers and tables. The DSL names common
+A `garun.session` Session centralizes ownership: its DuckDB connection, root tensor
+manager, defaults and registered networks, models, trainers and tables. The DSL names common
 DJL components and accepts native DJL objects for the rest; it does not
 reimplement DJL's entire Java API. Rust, classical estimators (k-means, SVM,
 XGBoost, …) and visualization remain out of scope.
@@ -68,10 +68,10 @@ Reusing a name fails unless `{:replace? true}` is given.
 
 ```clojure
 (prn current-session)
-;; #garun/session {:id "…" :status :open :database ":memory" :device :cpu :dtype :float32
+;; #garun/session {:identifier "…" :status :open :database ":memory" :device :cpu :dtype :float32
 ;;                 :engine "PyTorch" :seed 7 :workers 0
-;;                 :resources [{:id 1 :name :batteries :kind :table :rows 3200 :columns […]}
-;;                             {:id 2 :name :gru :kind :network :spec […] :parameters 2401}]}
+;;                 :resources [{:identifier 1 :name :batteries :kind :table :rows 3200 :columns […]}
+;;                             {:identifier 2 :name :gru :kind :network :spec […] :parameters 2401}]}
 ```
 
 Networks print as `#garun/network {...}`, trainers as `#garun/trainer {...}`.

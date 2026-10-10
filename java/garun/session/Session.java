@@ -61,7 +61,7 @@ public final class Session implements Context, AutoCloseable {
         }
     }
 
-    public String id() {
+    public String identifier() {
         return identifier;
     }
 
@@ -119,7 +119,7 @@ public final class Session implements Context, AutoCloseable {
 
     private void ensureOpen() {
         if (closed) {
-            throw error("closed", "Session is closed", Keyword.intern(null, "id"), identifier);
+            throw error("closed", "Session is closed", Keyword.intern(null, "identifier"), identifier);
         }
     }
 
@@ -274,7 +274,7 @@ public final class Session implements Context, AutoCloseable {
                 resource.lockForRelease();
                 registryLock.writeLock().lock();
                 try {
-                    Object registryKey = resource.name == null ? Long.valueOf(resource.id) : resource.name;
+                    Object registryKey = resource.name == null ? Long.valueOf(resource.identifier) : resource.name;
                     if (!registry.remove(registryKey, resource)) {
                         continue;
                     }
@@ -294,7 +294,7 @@ public final class Session implements Context, AutoCloseable {
         registryLock.readLock().lock();
         try {
             List<Resource> snapshot = new ArrayList<>(registry.values());
-            snapshot.sort(Comparator.comparingLong(resource -> resource.id));
+            snapshot.sort(Comparator.comparingLong(resource -> resource.identifier));
             return snapshot;
         } finally {
             registryLock.readLock().unlock();
@@ -335,7 +335,7 @@ public final class Session implements Context, AutoCloseable {
     public void close() {
         if (lifecycleLock.getReadHoldCount() != 0) {
             throw error("close-inside-operation", "Cannot close a session inside an operation",
-                    Keyword.intern(null, "id"), identifier);
+                    Keyword.intern(null, "identifier"), identifier);
         }
         lifecycleLock.writeLock().lock();
         try {

@@ -116,5 +116,6 @@ Signature: omp/gpt-6.1-sol
 - **Recommendation/checkpoint:** Use `session/open` + keyword names; `nn/train!` for the common path, `nn/trainer`/`epoch!` for custom loops. Saved as a separate jj change after `djl-wide`.
 - **Unresolved / dependencies:** CUDA still unverified (no NVIDIA driver). Hash-based keyed split can leave small splits empty for very few keys (observed with 12 batteries; error is explicit). Kibit not rerun (advisory only). Run `clojure -T:build javac` before tests/REPL.
 - **Next actions:** none required; candidate follow-ups only on request (per-epoch learning-rate schedules via `trainer` examples, GPU verification).
+- **Follow-up (same day):** renamed abbreviated identifier fields to full names per the naming directive: Java `Session.identifier()`, `Resource.identifier`; describe keys `:identifier`/`:session-identifier`. Rebuilt Java; 149 tests / 1,668 assertions green; cljfmt and clj-kondo clean. `:dtype` was kept as the established public DJL option name across tensor/nn/session.
 
 Signature: omp/claude-opus-5-5

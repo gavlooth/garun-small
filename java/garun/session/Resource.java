@@ -7,7 +7,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /** A registered value: concurrent readers, exclusive mutation and exclusive release. */
 public final class Resource implements AutoCloseable {
     public final Object name;
-    public final long id;
+    public final long identifier;
     public final Kind kind;
     public final Object value;
     public final boolean owned;
@@ -18,7 +18,7 @@ public final class Resource implements AutoCloseable {
 
     Resource(Object name, long identifier, Kind kind, Object value, boolean owned) {
         this.name = name;
-        this.id = identifier;
+        this.identifier = identifier;
         this.kind = kind;
         this.value = value;
         this.owned = owned;

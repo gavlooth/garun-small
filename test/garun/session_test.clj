@@ -80,20 +80,20 @@
               session-description (session/describe current-session)
               worker-description (session/describe current-worker)
               resource-description (session/describe resource)]
-          (is (= #{:id :status :database :device :dtype :engine :seed :schema :workers :resources}
+          (is (= #{:identifier :status :database :device :dtype :engine :seed :schema :workers :resources}
                  (set (keys session-description))))
           (is (= :open (:status session-description)))
           (is (= 1 (:workers session-description)))
           (is (= :cpu (:device session-description)))
           (is (= :float32 (:dtype session-description)))
           (is (= [resource-description] (:resources session-description)))
-          (is (= {:session-id (.id current-session) :status :open} worker-description))
-          (is (= #{:id :name :kind :owned? :released? :sql-name :columns :rows}
+          (is (= {:session-identifier (.identifier current-session) :status :open} worker-description))
+          (is (= #{:identifier :name :kind :owned? :released? :sql-name :columns :rows}
                  (set (keys resource-description))))
           (is (= {:name :sample :kind :table :owned? true :released? false
                   :sql-name (str (.schema current-session) "." (.-table table))
                   :columns [{:name "number" :type :int64}] :rows 1}
-                 (dissoc resource-description :id)))
+                 (dissoc resource-description :identifier)))
           (doseq [[value description tag] [[current-session session-description "#garun/session "]
                                            [current-worker worker-description "#garun/worker "]
                                            [resource resource-description "#garun/resource "]]]
@@ -143,8 +143,8 @@
             resources (.resources current-session)]
         (is (nil? (.-name anonymous-resource)))
         (is (= 3 (count resources)))
-        (is (= (sort (map #(.-id ^Resource %) resources))
-               (map #(.-id ^Resource %) resources))))
+        (is (= (sort (map #(.-identifier ^Resource %) resources))
+               (map #(.-identifier ^Resource %) resources))))
       (is (nil? (session/release! current-session :network)))
       (is (= [:first :replacement] (vec recording)))
       (is (= :session/unknown-name (error-code #(session/resource current-session :network :network))))
