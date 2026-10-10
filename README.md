@@ -1,6 +1,6 @@
 # garun-small
 
-garun-small is an experimental Clojure library for data preparation and deep learning on the JVM. Tables are query plans compiled through HoneySQL into SQL executed by DuckDB. Neural networks are Hiccup data structures compiled into Deep Java Library (DJL) blocks using the PyTorch engine. The project explores expressing data preparation and model training as Clojure data. The author found that Hiccup syntax was readable for both query plans and model architectures:
+garun-small is an experimental Clojure library for data preparation and deep learning on the JVM. Tables are query plans compiled through HoneySQL into SQL executed by DuckDB. Neural networks are Hiccup data structures compiled into Deep Java Library (DJL) blocks using the PyTorch engine. Both the query plan and the network in the example below are ordinary Clojure vectors and maps:
 
 ```clojure
 (require '[garun.session :as session]
