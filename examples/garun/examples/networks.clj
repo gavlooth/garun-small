@@ -1,5 +1,5 @@
 (ns garun.examples.networks
-  "Fourteen copyable network specs, built and predicted natively in one CPU session.
+  "Sixteen copyable network specs, built and predicted natively in one CPU session.
   Shapes use N=batch, C=channels, T=time and H=hidden features. Convolutions use
   [N,C,...]; recurrent and attention inputs use [N,T,H]. Token IDs are int64,
   but embedding weights remain float32. Trusted DuckDB range() SQL generates the
@@ -39,6 +39,24 @@
    [:conv2d {:filters 4 :kernel [3 3] :padding [1 1]}] [:relu]
    [:max-pool2d {:kernel [2 2] :stride [2 2]}]
    [:flatten] [:linear 3]])
+
+;; Separate image and measurement tensors join after image feature extraction.
+(def image-measurements-classifier
+  [:graph {:inputs [:image :measurements] :outputs [:logits]}
+   [:features [:image]
+    [:sequential [:conv2d {:filters 8 :kernel [3 3]}] [:relu] [:global-avg-pool2d]]]
+   [:joined [:features :measurements] [:concat {:axis 1}]]
+   [:hidden [:joined] [:sequential [:linear 32] [:relu]]]
+   [:logits [:hidden] [:linear 3]]])
+
+;; The first hidden tensor skips two later nodes before the elementwise merge.
+(def long-skip
+  [:graph {:inputs [:input] :outputs [:logits]}
+   [:first [:input] [:sequential [:linear 4] [:relu]]]
+   [:second [:first] [:sequential [:linear 4] [:relu]]]
+   [:third [:second] [:linear 4]]
+   [:sum [:first :third] [:add]]
+   [:logits [:sum] [:linear 2]]])
 
 ;; 1-D convolution expects channels before time: [N,2,8] -> [N,1].
 (def sequence-convolution
@@ -114,6 +132,9 @@
    {:name :residual :spec residual :input-shape [4]}
    {:name :inception :spec inception :input-shape [1 8 8]}
    {:name :cnn :spec cnn :input-shape [1 8 8]}
+   {:name :image-measurements-classifier :spec image-measurements-classifier
+    :input-shapes [[1 1 8 8] [1 4]]}
+   {:name :long-skip :spec long-skip :input-shape [4]}
    {:name :sequence-convolution :spec sequence-convolution :input-shape [2 8]}
    {:name :autoencoder :spec autoencoder :input-shape [1 8 8]}
    {:name :gru-regressor :spec gru-regressor :input-shape [5 2]}
@@ -126,22 +147,28 @@
    {:name :averaged-branches :spec averaged-branches :input-shape [4]}])
 
 (defn run!
-  "Build every spec, predict a batch of two synthetic tensors, and report shapes."
+  "Build every spec, predict a batch of two samples per input, and report shapes."
   []
   (with-open [current-session (session/open {:seed 7 :device :cpu})]
     (into (sorted-map)
-          (map (fn [{:keys [name spec input-shape input-dtype]}]
+          (map (fn [{:keys [name spec input-dtype] :as entry}]
                  (let [network (nn/build current-session spec
-                                         {:input-shape input-shape :name name})
-                       dimensions (into [2] input-shape)
+                                         (assoc (select-keys entry [:input-shape :input-shapes])
+                                                :name name))
                        ;; These arrays and predictions are owned by the session manager.
-                       matrix (table/matrix current-session
-                                            (table/query input-data [:limit (reduce * dimensions)])
-                                            [:value])
-                       inputs (tensor/array current-session (:data matrix)
-                                            {:shape dimensions :dtype (or input-dtype :float32)})
+                       inputs (mapv (fn [input-shape]
+                                      (let [dimensions (assoc input-shape 0 2)
+                                            matrix (table/matrix
+                                                    current-session
+                                                    (table/query input-data
+                                                                 [:limit (reduce * dimensions)])
+                                                    [:value])]
+                                        (tensor/array current-session (:data matrix)
+                                                      {:shape dimensions
+                                                       :dtype (or input-dtype :float32)})))
+                                    (:input-shapes network))
                        outputs (nn/predict current-session network inputs {})]
-                   [name {:input-shape (nd/shape inputs)
+                   [name {:input-shapes (mapv nd/shape inputs)
                           :output-shapes (mapv nd/shape outputs)
                           :finite? (every? #(Double/isFinite (double %))
                                            (mapcat nd/to-vector outputs))}])))

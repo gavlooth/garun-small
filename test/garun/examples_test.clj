@@ -18,6 +18,8 @@
    :residual [[2 4]]
    :inception [[2 3]]
    :cnn [[2 3]]
+   :image-measurements-classifier [[2 3]]
+   :long-skip [[2 2]]
    :sequence-convolution [[2 1]]
    :autoencoder [[2 1 8 8]]
    :gru-regressor [[2 1]]
@@ -48,7 +50,8 @@
                                                          reordered-partitions)}])))
                 [[:binary training/binary-data training/binary-partitions]
                  [:multiclass training/multiclass-data training/multiclass-partitions]
-                 [:regression training/regression-data training/regression-partitions]]))
+                 [:regression training/regression-data training/regression-partitions]
+                 [:multi-input training/multi-input-data training/multi-input-partitions]]))
         elapsed-milliseconds (/ (- (System/nanoTime) started) 1.0e6)]
     (println (format "Gallery examples runtime: %.1f ms" elapsed-milliseconds))
 
@@ -81,7 +84,10 @@
              (into {} (map (fn [[name summary]] [name (:output-shapes summary)]))
                    network-summary)))
       (is (every? :finite? (vals network-summary)))
-      (is (every? #(= 2 (first (:input-shape %))) (vals network-summary))))
+      (is (every? #(= 2 (first %)) (mapcat :input-shapes (vals network-summary))))
+      (is (= [[2 1 8 8] [2 4]]
+             (get-in network-summary [:image-measurements-classifier :input-shapes])))
+      (is (= [[2 4]] (get-in network-summary [:long-skip :input-shapes]))))
 
     (testing "Tabular training and validation are disjoint, complete and keyed deterministically"
       (doseq [[example {:keys [source rows reordered-rows]}] training-partitions]
@@ -95,7 +101,7 @@
           (is (= partition-keys reordered-keys) (name example)))))
 
     (testing "Short training runs produce finite, decreasing losses"
-      (doseq [example [:binary :multiclass :regression :sequence :custom]]
+      (doseq [example [:binary :multiclass :regression :multi-input :sequence :custom]]
         (let [history (get-in training-summary [example :history])]
           (is (<= 2 (count history) 8) (name example))
           (is (every? finite? (map :training-loss history)) (name example))
@@ -119,6 +125,19 @@
              (count (get-in training-summary [:regression :predictions]))))
       (is (every? finite? (get-in training-summary [:regression :predictions])))
       (is (every? finite? (vals (get-in training-summary [:regression :evaluation]))))
+      (is (= (count (second (get-in training-partitions [:multi-input :rows])))
+             (count (get-in training-summary [:multi-input :predictions]))))
+      (is (every? finite? (get-in training-summary [:multi-input :predictions])))
+      (is (= #{:loss :mae :mse}
+             (set (keys (get-in training-summary [:multi-input :evaluation])))))
+      (is (every? finite? (vals (get-in training-summary [:multi-input :evaluation]))))
+      (is (= 8 (count (get-in training-summary [:multi-input :history]))))
+      (is (every? finite? (map :validation-loss
+                               (get-in training-summary [:multi-input :history]))))
+      (is (every? #(= #{:mae :mse} (set (keys (:metrics %))))
+                  (get-in training-summary [:multi-input :history])))
+      (is (= :validation-loss (get-in training-summary [:multi-input :best :monitor])))
+      (is (= :completed (get-in training-summary [:multi-input :stopped])))
       (is (= 12 (count (get-in training-summary [:sequence :predictions]))))
       (is (every? finite? (get-in training-summary [:sequence :predictions])))
       (is (every? finite? (vals (get-in training-summary [:sequence :evaluation]))))

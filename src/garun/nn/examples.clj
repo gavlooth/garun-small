@@ -2,7 +2,8 @@
   "Prepare table examples and align their labels, predictions, and metrics.
 
   DuckDB computes training-only standardization statistics and orders sequence
-  rows. This namespace owns the persisted input specification, window layouts,
+  rows. All feature groups, labels and window flags share one extraction. This
+  namespace owns the persisted grouped input specification, window layouts,
   and manager-owned arrays/ArrayDatasets. It accepts Model/network data without
   depending on garun.nn; network lifecycles and training remain in that namespace."
   (:require [clojure.edn :as edn]
@@ -40,10 +41,35 @@
       (invalid error "Columns must be a keyword or nonempty vector of keywords" {:columns columns}))
     columns))
 
+(defn- input-groups [network columns]
+  (let [spec (:spec network)
+        graph-inputs (when (and (vector? spec) (= :graph (first spec)))
+                       (:inputs (second spec)))
+        groups (cond
+                 (map? columns)
+                 (do
+                   (when-not graph-inputs
+                     (invalid :nn/invalid-features "Named feature groups require a graph network"
+                              {:x columns}))
+                   (when-not (= (set graph-inputs) (set (keys columns)))
+                     (invalid :nn/invalid-features "Named feature groups must match the graph inputs"
+                              {:x columns :inputs graph-inputs}))
+                   (mapv columns graph-inputs))
+
+                 (and (vector? columns) (every? keyword? columns)) [columns]
+                 (vector? columns) columns
+                 :else nil)]
+    (when-not (and (seq groups)
+                   (every? #(and (vector? %) (seq %) (every? keyword? %)) groups)
+                   (= (count groups) (count (:input-shapes network))))
+      (invalid :nn/invalid-features "Features require one nonempty keyword vector per network input"
+               {:x columns :input-shapes (:input-shapes network)}))
+    groups))
+
 (defn- input-specification [network options]
   (let [{:keys [sequence standardize] :as specification}
         (merge (stored-inputs (:model network)) (select-keys options [:x :y :sequence :standardize]))
-        columns (:x specification)
+        groups (input-groups network (:x specification))
         _ (when (some? sequence)
             (when-not (map? sequence)
               (invalid :nn/invalid-options "Options must be a map" {:context :sequence :options sequence}))
@@ -57,24 +83,22 @@
               (invalid :nn/invalid-sequence "Sequence requires positive :length and a partition column"
                        {:sequence sequence}))
             (column-vector (:order-by sequence) :nn/invalid-sequence))
-        column-count (if (vector? columns) (count columns) 0)
-        expected-shape (if sequence [(:length sequence) column-count] [column-count])]
-    (when-not (and (= 1 (count (:input-shapes network)))
-                   (= (count expected-shape) (count (:input-shape network))))
-      (invalid :nn/non-tabular-input "Table input rank must match the input specification"
+        expected-shapes (mapv #(if sequence [(:length sequence) (count %)] [(count %)]) groups)
+        input-shapes (mapv #(vec (rest %)) (:input-shapes network))]
+    (when-not (= (mapv count expected-shapes) (mapv count input-shapes))
+      (invalid :nn/non-tabular-input "Table input ranks must match the input specification"
                {:input-shapes (:input-shapes network) :sequence sequence}))
     (when-not (= DataType/FLOAT32 (:dtype network))
       (invalid :nn/non-tabular-dtype "Table operations require a float32 network" {:dtype (:dtype network)}))
-    (when-not (and (vector? columns) (seq columns) (every? keyword? columns)
-                   (= expected-shape (:input-shape network)))
-      (invalid :nn/invalid-features "Features/sequence must match the network input shape"
-               {:x columns :sequence sequence :input-shape (:input-shape network)}))
+    (when-not (= expected-shapes input-shapes)
+      (invalid :nn/invalid-features "Features/sequence must match the network input shapes"
+               {:x groups :sequence sequence :input-shapes (:input-shapes network)}))
     (when-not (or (nil? standardize)
                   (and (vector? standardize) (every? #{:x :y} standardize)
                        (= (count standardize) (count (distinct standardize)))))
       (invalid :nn/invalid-standardization ":standardize must be a subset of [:x :y]"
                {:standardize standardize}))
-    specification))
+    (assoc specification :x groups)))
 
 (defn inference-inputs
   "Resolve table inputs against network shape/dtype and stored training statistics."
@@ -88,8 +112,13 @@
     (assoc specification :statistics statistics)))
 
 (defn- training-statistics [context source specification]
-  (let [groups (select-keys specification (:standardize specification))
-        columns (vec (distinct (mapcat #(column-vector % :nn/invalid-labels) (vals groups))))
+  (let [groups (into {}
+                     (map (fn [group]
+                            [group (if (= group :x)
+                                     (vec (mapcat identity (:x specification)))
+                                     (column-vector (:y specification) :nn/invalid-labels))]))
+                     (:standardize specification))
+        columns (vec (distinct (mapcat identity (vals groups))))
         aliases (mapv (fn [index column]
                         {:column column :mean (keyword (str "mean_" index))
                          :standard-deviation (keyword (str "standard_deviation_" index))})
@@ -111,8 +140,11 @@
                                          [column {:mean (double average)
                                                   :standard-deviation (max 1.0e-9 (double deviation))}])))
                              aliases)]
-        (into {} (map (fn [[group group-columns]]
-                        [group (mapv per-column (column-vector group-columns :nn/invalid-labels))]))
+        (into {}
+              (map (fn [[group group-columns]]
+                     [group (if (= group :x)
+                              (mapv #(mapv per-column %) (:x specification))
+                              (mapv per-column group-columns))]))
               groups)))))
 
 (defn training-inputs
@@ -139,7 +171,7 @@
   within partitions and labels come from the window's last row. One query extracts
   features, labels and flags together without coercing partition identities."
   [context source specification labels?]
-  (let [columns (:x specification)
+  (let [input-groups (:x specification)
         label-columns (when labels? (column-vector (:y specification) :nn/invalid-labels))
         {:keys [length partition-by order-by] :as sequence} (:sequence specification)
         ;; Only an exact 0/1 window-end flag enters float32 storage, never a partition ID.
@@ -156,24 +188,27 @@
                                [:order-by (into [partition-by]
                                                 (column-vector order-by :nn/invalid-sequence))]])
                  source)
-        groups (cond-> [columns] labels? (conj label-columns) sequence (conj [window-end-column]))
+        groups (cond-> input-groups labels? (conj label-columns) sequence (conj [window-end-column]))
         matrices (table/matrices context source groups)
-        features (first matrices)
-        labels (when labels? (second matrices))
+        features (subvec matrices 0 (count input-groups))
+        labels (when labels? (nth matrices (count input-groups)))
         window-ends (when sequence (last matrices))
         windows (when sequence
                   (into []
                         (comp
                          (filter #(== 1.0 (aget ^floats (:data window-ends) (int %))))
                          (map #(range (inc (- % length)) (inc %))))
-                        (range (:rows features))))
-        row-count (if sequence (count windows) (:rows features))]
+                        (range (:rows (first features)))))
+        row-count (if sequence (count windows) (:rows (first features)))]
     {:rows row-count
-     :features (if sequence
-                 {:rows row-count :cols (count columns)
-                  :shape [row-count length (count columns)]
-                  :data (float-array (mapcat (fn [window] (mapcat #(matrix-row features %) window)) windows))}
-                 (assoc features :shape [row-count (count columns)]))
+     :features (mapv (fn [matrix]
+                       (if sequence
+                         {:rows row-count :cols (:cols matrix)
+                          :shape [row-count length (:cols matrix)]
+                          :data (float-array
+                                 (mapcat (fn [window] (mapcat #(matrix-row matrix %) window)) windows))}
+                         (assoc matrix :shape [row-count (:cols matrix)])))
+                     features)
      :labels (when labels?
                (if sequence
                  {:rows row-count :cols (count label-columns)
@@ -218,6 +253,14 @@
         (.div (.sub array means) deviations))
       array)))
 
+(defn feature-arrays
+  "Create one manager-owned input tensor per aligned feature group."
+  [^NDManager manager examples specification]
+  (let [statistics (get-in specification [:statistics :x])]
+    (mapv (fn [index matrix]
+            (standardized-array manager matrix (get statistics index) false))
+          (range) (:features examples))))
+
 (defn- shuffle-indices! [indices ^Random random]
   ;; RNG is the mutable SDK boundary; the permutation is a persistent reduction.
   (reduce (fn [order index]
@@ -229,7 +272,7 @@
   "Build a manager-owned ArrayDataset with reproducible sampling and scaled labels."
   [^NDManager manager examples specification options shuffle? loss]
   (let [statistics (:statistics specification)
-        features (standardized-array manager (:features examples) (:x statistics) false)
+        features (feature-arrays manager examples specification)
         labels (standardized-array manager (:labels examples) (:y statistics) (= loss :ce))
         random (Random. (long (:seed options)))
         sampler (reify Sampler$SubSampler
@@ -238,7 +281,7 @@
                           ^List order (if shuffle? (shuffle-indices! indices random) indices)]
                       (.iterator order))))
         ^ArrayDataset$Builder builder (ArrayDataset$Builder.)]
-    (.setData builder (into-array NDArray [features]))
+    (.setData builder (into-array NDArray features))
     (.optLabels builder (into-array NDArray [labels]))
     (.setSampling builder (BatchSampler. sampler (int (:batch options)) false))
     (.build builder)))

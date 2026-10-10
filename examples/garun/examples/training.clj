@@ -1,10 +1,11 @@
 (ns garun.examples.training
-  "Five small CPU training stories: binary and multiclass logits, standardized
-  regression, partitioned battery sequences with early stopping, a custom epoch
-  loop and a model save/load round trip. DuckDB range() generates all data without
-  downloads. Trusted SQL only generates rows; Garun Hiccup selects and splits them.
-  Binary, multiclass and regression use seeded, sample-keyed held-out validation;
-  the battery example holds out whole batteries."
+  "Six small CPU training stories: binary and multiclass logits, standardized
+  regression, a multi-input graph, partitioned battery sequences with early
+  stopping and a custom epoch loop. A model save/load round trip preserves
+  regression predictions. DuckDB range() generates all data without downloads.
+  Trusted SQL only generates rows; Garun Hiccup selects and splits them.
+  Tabular examples use seeded, sample-keyed held-out validation; the battery
+  example holds out whole batteries."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
             [garun.nn :as nn]
@@ -31,6 +32,18 @@
                         "100.0 + 20.0 * (i - 15.5) / 16.0 AS target "
                         "FROM range(32) AS samples(i)")}])
 
+(def multi-input-data
+  [:duckdb {:query (str "SELECT i AS sample_id, (i - 15.5) / 16.0 AS horizontal, "
+                        "(i % 4 - 1.5) / 2.0 AS vertical, "
+                        "20.0 + (i % 8) / 4.0 AS temperature, "
+                        "15.0 + 2.0 * (i - 15.5) / 16.0 - (i % 4 - 1.5) / 2.0 "
+                        "+ (i % 8) / 8.0 AS target FROM range(32) AS samples(i)")}])
+
+(def multi-input-network
+  [:graph {:inputs [:position :measurements] :outputs [:prediction]}
+   [:joined [:position :measurements] [:concat {:axis 1}]]
+   [:prediction [:joined] [:linear 1]]])
+
 (def binary-partitions
   (table/query binary-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
 
@@ -39,6 +52,9 @@
 
 (def regression-partitions
   (table/query regression-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
+
+(def multi-input-partitions
+  (table/query multi-input-data [:split {:fractions [0.8 0.2] :seed 7 :key :sample_id}]))
 
 (def battery-data
   [:duckdb {:query (str "SELECT i // 8 AS battery_id, i % 8 AS cycle, "
@@ -87,11 +103,12 @@
         (session/release! current-session handle)))))
 
 (defn run!
-  "Train all five examples and return losses, predictions, metrics and persistence evidence."
+  "Train all six examples and return losses, predictions, metrics and persistence evidence."
   []
   (let [[binary-training binary-validation] binary-partitions
         [multiclass-training multiclass-validation] multiclass-partitions
         [regression-training regression-validation] regression-partitions
+        [multi-input-training multi-input-validation] multi-input-partitions
         directory (str (Files/createTempDirectory "garun-gallery-model-"
                                                   (make-array FileAttribute 0)))]
     (try
@@ -125,6 +142,19 @@
                                             :validation regression-validation :metrics [:mae]})
               regression-predictions (nn/predict current-session :regression regression-validation {})
 
+              ;; Named column groups resolve in the graph's declared input order.
+              graph-network (nn/build current-session multi-input-network
+                                      {:input-shapes [[1 2] [1 1]] :name :multi-input})
+              multi-input-result (nn/train! current-session graph-network multi-input-training
+                                            {:x {:measurements [:temperature]
+                                                 :position [:horizontal :vertical]}
+                                             :y :target :standardize [:x :y] :loss :mse
+                                             :optim [:adam {:lr 0.1}] :epochs 8 :batch 32
+                                             :shuffle? false :validation multi-input-validation
+                                             :metrics [:mae :mse]})
+              multi-input-predictions (nn/predict current-session :multi-input
+                                                  multi-input-validation {})
+
               ;; Keep whole batteries out of training; no window crosses a partition.
               training-batteries (table/query battery-data [:where [:< :battery_id 6]])
               validation-batteries (table/query battery-data [:where [:>= :battery_id 6]])
@@ -143,6 +173,9 @@
            :regression (assoc regression-result :predictions regression-predictions
                               :evaluation (nn/evaluate current-session :regression regression-validation
                                                        {:metrics [:mae :mse]}))
+           :multi-input (assoc multi-input-result :predictions multi-input-predictions
+                               :evaluation (nn/evaluate current-session :multi-input
+                                                        multi-input-validation {:metrics [:mae :mse]}))
            :sequence (assoc sequence-result :predictions sequence-predictions
                             :evaluation (nn/evaluate current-session :battery validation-batteries
                                                      {:metrics [:mae]}))

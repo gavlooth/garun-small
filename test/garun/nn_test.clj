@@ -18,7 +18,7 @@
            [ai.djl.ndarray NDArray NDList NDManager]
            [ai.djl.ndarray.types DataType Shape]
            [ai.djl.training DefaultTrainingConfig Trainer]
-           [ai.djl.training.dataset ArrayDataset$Builder]
+           [ai.djl.training.dataset ArrayDataset$Builder Batch]
            [ai.djl.training.listener TrainingListenerAdapter]
            [ai.djl.translate NoopTranslator Translator TranslatorContext]
            [garun.session Session]
@@ -598,7 +598,7 @@
                         (for [[battery rows feature] partitions
                               cycle (range rows)]
                           {:battery battery :cycle cycle :x feature :y (+ (* feature 100) cycle)}))))
-          specification {:x [:x] :y :y :sequence {:length 3 :partition-by :battery :order-by :cycle}}
+          specification {:x [[:x]] :y :y :sequence {:length 3 :partition-by :battery :order-by :cycle}}
           queries (ConcurrentLinkedQueue.)
           extract-matrix table/matrix
           extracted (with-redefs [table/matrix (fn [context source columns]
@@ -610,10 +610,10 @@
           expected-labels (mapcat (fn [[_ rows feature]]
                                     (map #(float (+ (* feature 100) %)) (range 2 rows)))
                                   partitions)
-          windows (partition 3 (:data (:features extracted)))]
+          windows (partition 3 (:data (first (:features extracted))))]
       (is (= 8 (reduce + (map (fn [[_ rows _]] (max 0 (- rows 2))) partitions))
              (:rows extracted) (count windows)))
-      (is (= [8 3 1] (get-in extracted [:features :shape])))
+      (is (= [8 3 1] (get-in extracted [:features 0 :shape])))
       (is (every? #(apply = %) windows))
       (is (= (vec expected-features) (mapv first windows)))
       (is (= (vec expected-labels) (vec (get-in extracted [:labels :data]))))
@@ -711,10 +711,10 @@
                   :epochs 1 :batch 4 :optim [:sgd {:lr [:fixed {:value 0.0}]}]})
       (let [statistics (:statistics (network-inputs network))
             predictions (nn/predict current-session network source {})]
-        (is (= 1.5 (get-in statistics [:x 0 :mean])))
+        (is (= 1.5 (get-in statistics [:x 0 0 :mean])))
         (is (= 80.0 (get-in statistics [:y 0 :mean])))
         (is (< (Math/abs (- (Math/sqrt 1.25)
-                            (get-in statistics [:x 0 :standard-deviation]))) 1.0e-12))
+                            (get-in statistics [:x 0 0 :standard-deviation]))) 1.0e-12))
         (is (< (mse predictions [65.0 75.0 85.0 95.0]) 1.0e-8))
         (is (= [0.0 0.5 1.0 1.5]
                (nn/predict current-session network source {:standardize []})))
@@ -890,3 +890,172 @@
       (is (= (mapv #(assoc % :event :epoch :network :battery-gru) history) (pop observed)))
       (is (= {:event :finished :stopped (:stopped result) :best (:best result)} (peek observed)))
       (is (= [:network] (mapv :kind (:resources (session/describe current-session))))))))
+
+(def ^:private two-input-regression-spec
+  [:sequential
+   [:lambda (fn [inputs] (nd/ndlist [(nd/concat (vec inputs) 1)]))]
+   [:linear 1]])
+
+(deftest grouped-table-regression-trains-and-persists-input-order
+  (with-temporary-directory!
+    (fn [directory]
+      (with-open [current-session (session/open {:seed 47})]
+        (let [values (mapv #(/ % 20.0) (range -20 21))
+              other (mapv #(- (/ (mod % 7) 3.0) 1.0) (range 41))
+              third (mapv #(- (/ (mod % 5) 2.0) 1.0) (range 41))
+              truth (mapv (fn [a b c] (+ 1.0 (* 2.0 a) (* -0.5 b) (* 3.0 c)))
+                          values other third)
+              source (table/from {:a values :b other :c third :y truth})
+              groups [[:a :b] [:c]]
+              network (nn/build current-session two-input-regression-spec
+                                {:input-shapes [[1 2] [1 1]]})
+              before (nn/predict current-session network source {:x groups})
+              result (nn/train! current-session network source
+                                {:x groups :y :y :standardize [:x :y] :validation source
+                                 :epochs 100 :batch 41 :shuffle? false :optim [:adam {:lr 0.08}]})
+              history (:history result)
+              predictions (nn/predict current-session network source {})
+              evaluation (nn/evaluate current-session network source {:metrics [:mae]})]
+          (is (= 41 (count before) (count predictions)))
+          (is (< (:training-loss (last history)) (:training-loss (first history))))
+          (is (< (:validation-loss (last history)) (:validation-loss (first history))))
+          (is (< (mse predictions truth) 0.05))
+          (is (Double/isFinite (double (:mae evaluation))))
+          (is (< (:mae evaluation) 0.15))
+          (is (= groups (:x (network-inputs network))))
+          (is (= predictions (nn/predict current-session network source {:x groups})))
+          (nn/save! current-session network directory {:spec two-input-regression-spec})
+          (let [restored (nn/load current-session directory {:spec two-input-regression-spec})]
+            (is (= [[1 2] [1 1]] (:input-shapes restored)))
+            (is (= (network-inputs network) (network-inputs restored)))
+            (is (= predictions (nn/predict current-session restored source {})))
+            (is (= evaluation (nn/evaluate current-session restored source {:metrics [:mae]})))))))))
+
+(deftest grouped-random-order-table-extraction-keeps-data-and-labels-aligned
+  (with-open [current-session (session/open)]
+    (let [source (table/from
+                  [:duckdb {:query (str "SELECT i AS a, 10 * i AS b, -3 * i AS c, 7 * i + 2 AS y "
+                                        "FROM range(64) t(i) ORDER BY random()")}])
+          network (nn/build current-session two-input-regression-spec
+                            {:input-shapes [[1 2] [1 1]]})
+          queries (ConcurrentLinkedQueue.)
+          extract-matrix table/matrix
+          handle (with-redefs [table/matrix (fn [context source columns]
+                                              (.add queries columns)
+                                              (extract-matrix context source columns))]
+                   (nn/trainer current-session network source
+                               {:x [[:b :a] [:c]] :y :y :batch 64 :shuffle? false}))
+          ^Trainer native-trainer (:native-trainer handle)]
+      (try
+        (is (= [[:b :a :c :y]] (vec queries)))
+        (let [rows (reduce (fn [rows ^Batch batch]
+                             (with-open [batch batch]
+                               (let [[left right] (.getData batch)
+                                     labels (.singletonOrThrow (.getLabels batch))]
+                                 (is (= [[64 2] [64 1]] (mapv nd/shape [left right])))
+                                 (into rows
+                                       (map (fn [[b a] c y] [a b c y])
+                                            (partition 2 (nd/to-vector left))
+                                            (nd/to-vector right) (nd/to-vector labels))))))
+                           [] (.iterateDataset native-trainer (:dataset handle)))]
+          (is (= 64 (count rows)))
+          (is (= (mapv double (range 64)) (vec (sort (map first rows)))))
+          (is (every? (fn [[a b c y]] (and (= (* 10.0 a) b)
+                                           (= (* -3.0 a) c)
+                                           (= (+ (* 7.0 a) 2.0) y))) rows)))
+        (finally (session/release! current-session handle))))))
+
+(deftest grouped-standardization-shares-per-column-training-statistics
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session two-input-regression-spec
+                            {:input-shapes [[1 2] [1 1]]})
+          source (table/from {:a [0 1 2 3] :b [10 20 30 40] :y [50 70 90 110]})
+          specification (examples/training-inputs current-session network source
+                                                  {:x [[:a :b] [:a]] :y :y :standardize [:x :y]} :mse)
+          statistics (:statistics specification)
+          prepared (examples/table-examples current-session source specification true)
+          [left right] (examples/feature-arrays (context/manager current-session) prepared specification)
+          normalized (mapv #(/ (- % 1.5) (Math/sqrt 1.25)) (range 4))]
+      (is (= [[1.5 25.0] [1.5]] (mapv #(mapv :mean %) (:x statistics))))
+      (is (= (get-in statistics [:x 0 0]) (get-in statistics [:x 1 0])))
+      (is (= 80.0 (get-in statistics [:y 0 :mean])))
+      (is (= [[4 2] [4 1]] (mapv nd/shape [left right])))
+      (is (< (mse (nd/to-vector right) normalized) 1.0e-12))
+      (is (< (mse (nd/to-vector left) (vec (mapcat #(repeat 2 %) normalized))) 1.0e-12)))))
+
+(deftest grouped-sequence-windows-share-layout-and-window-end-labels
+  (with-open [current-session (session/open)]
+    (let [spec [:sequential
+                [:lambda (fn [inputs] (nd/ndlist [(nd/concat (vec inputs) 2)]))]
+                [:index ":, -1"] [:linear 1]]
+          network (nn/build current-session spec {:input-shapes [[1 3 2] [1 3 1]]})
+          source (table/query (sequence-table 0.0) [:derive {:extra [:* :x 10]}])
+          options {:x [[:x :cycle] [:extra]] :y :y
+                   :sequence {:length 3 :partition-by :battery :order-by :cycle}}
+          specification (examples/training-inputs current-session network source options :mse)
+          prepared (examples/table-examples current-session source specification true)
+          arrays (examples/feature-arrays (context/manager current-session) prepared specification)
+          windows (vec (for [row-count [6 5] end (range 2 row-count)]
+                         (range (- end 2) (inc end))))
+          expected (mapv double (mapcat identity windows))
+          history (:history (nn/train! current-session network source
+                                       (assoc options :epochs 3 :batch 4 :shuffle? false)))]
+      (is (= 7 (:rows prepared)))
+      (is (= [[7 3 2] [7 3 1]] (mapv :shape (:features prepared)) (mapv nd/shape arrays)))
+      (is (= (vec (mapcat #(repeat 2 %) expected)) (nd/to-vector (first arrays))))
+      (is (= (mapv #(* 10.0 %) expected) (nd/to-vector (second arrays))))
+      (is (= (mapv #(+ 100.0 (* 20.0 (last %))) windows)
+             (mapv double (get-in prepared [:labels :data]))))
+      (is (every? #(Double/isFinite (double (:training-loss %))) history))
+      (is (= 7 (count (nn/predict current-session network source {}))))
+      (is (Double/isFinite (double (:mae (nn/evaluate current-session network source {:metrics [:mae]}))))))))
+
+(deftest grouped-feature-specifications-fail-loudly
+  (with-open [current-session (session/open)]
+    (let [network (nn/build current-session two-input-regression-spec
+                            {:input-shapes [[1 2] [1 1]]})
+          source (table/from {:a [0 1] :b [2 3] :c [4 5] :y [6 7]})
+          invalid-features [nil :a [] [[:a :b] []] [[:a "b"] [:c]] [[:a :b] :c]
+                            [[:a] [:c]] [[:a :b]] [[:a :b] [:c] [:a]] [:a :b]
+                            {:left [:a :b] :right [:c]}]]
+      (doseq [columns invalid-features]
+        (testing (pr-str columns)
+          (is (= :nn/invalid-features
+                 (error-key #(nn/predict current-session network source {:x columns}))))
+          (is (= :nn/invalid-features
+                 (error-key #(nn/evaluate current-session network source {:x columns :y :y}))))
+          (is (= :nn/invalid-features
+                 (error-key #(nn/trainer current-session network source {:x columns :y :y})))))))))
+
+(deftest named-graph-feature-groups-resolve-and-persist-in-network-input-order
+  (with-temporary-directory!
+    (fn [directory]
+      (with-open [current-session (session/open)]
+        (let [spec [:graph {:inputs [:left :right] :outputs [:output]}
+                    [:joined [:left :right] [:concat {:axis 1}]]
+                    [:output [:joined] [:linear 1]]]
+              network (nn/build current-session spec {:input-shapes [[1 2] [1 1]]})
+              source (table/from {:a [0 1 2 3] :b [10 20 30 40] :c [4 3 2 1] :y [5 6 7 8]})
+              named-groups (array-map :right [:c] :left [:a :b])
+              groups [[:a :b] [:c]]
+              result (nn/train! current-session network source
+                                {:x named-groups :y :y :standardize [:x]
+                                 :epochs 3 :batch 4 :validation source})
+              predictions (nn/predict current-session network source {})]
+          (is (= 3 (count (:history result))))
+          (is (= groups (:x (network-inputs network))))
+          (is (= predictions
+                 (nn/predict current-session network source {:x groups})
+                 (nn/predict current-session network source {:x named-groups})))
+          (is (Double/isFinite (double (:mae (nn/evaluate current-session network source
+                                                          {:x named-groups :metrics [:mae]})))))
+          (doseq [columns [{:left [:a :b]} {:left [:a :b] :right [:c] :unknown [:a]}
+                           {:left [:a :b] :right []} {:left [:a "b"] :right [:c]}]]
+            (is (= :nn/invalid-features
+                   (error-key #(nn/predict current-session network source {:x columns})))))
+          (nn/save! current-session network directory)
+          (let [restored (nn/load current-session directory)]
+            (is (= spec (:spec restored)))
+            (is (= (network-inputs network) (network-inputs restored)))
+            (is (= predictions (nn/predict current-session restored source {})))
+            (is (= predictions (nn/predict current-session restored source {:x named-groups})))))))))

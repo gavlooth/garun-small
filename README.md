@@ -91,8 +91,8 @@ MIT; see [`LICENSE`](LICENSE).
 The example namespaces demonstrate query and model specifications using synthetic data. They run on CPU without external datasets:
 
 - [Tables](examples/garun/examples/tables.clj): expressions, HoneySQL CASE, aggregations, running window functions, left/semi/anti joins, keyed splits, seeded sampling, table materialization, and a Parquet round trip.
-- [Networks](examples/garun/examples/networks.clj): 14 runnable specs: MLP, residual, Inception, CNN, sequence convolution, convolutional autoencoder, GRU, LSTM, bidirectional LSTM, embedding/text classifier, transformer classifier, attention, NDArray lambda, and custom parallel layers.
-- [Training](examples/garun/examples/training.clj): BCE and CE classification and regression with deterministic validation splits, feature standardization, sequence windows, early stopping, epoch observers, custom training loops, and model persistence.
+- [Networks](examples/garun/examples/networks.clj): 16 runnable specs: MLP, residual, Inception, CNN, image-and-measurements graph classifier, long-skip graph, sequence convolution, convolutional autoencoder, GRU, LSTM, bidirectional LSTM, embedding/text classifier, transformer classifier, attention, NDArray lambda, and custom parallel layers.
+- [Training](examples/garun/examples/training.clj): BCE and CE classification, regression, and multi-input graph training with deterministic validation splits, feature standardization, sequence windows, early stopping, epoch observers, custom training loops, and model persistence.
 
 Each file exposes `(run!)`, returning a data summary, and `-main`, printing and returning it. `garun.examples-test` runs all three and verifies output shapes, decreasing losses, keyed split boundaries, and persistence.
 
@@ -202,6 +202,18 @@ DuckDB integer aggregations produce 128-bit HUGEINT values. Parquet does not sup
        :metrics [:mae]})))
 ```
 
+9. A graph classifier with separate image and measurement inputs.
+
+```clojure
+[:graph {:inputs [:image :measurements] :outputs [:logits]}
+ [:features [:image]
+  [:sequential [:conv2d {:filters 8 :kernel [3 3]}] [:relu] [:global-avg-pool2d]]]
+ [:joined [:features :measurements] [:concat {:axis 1}]]
+ [:hidden [:joined] [:sequential [:linear 32] [:relu]]]
+ [:logits [:hidden] [:linear 3]]]
+;; :input-shapes [[1 1 8 8] [1 4]], native batches [2 1 8 8] and [2 4] -> [2 3]
+```
+
 Network specifications are data structures. `nn/build` compiles a specification into a DJL model instance. The network gallery demonstrates `nn/build` and `nn/predict` for each spec, including int64 embedding inputs. The training gallery uses `:observe tap>` to send epoch and completion maps to Clojure's tap queue.
 
 ## Namespaces
@@ -279,7 +291,7 @@ Expressions inside `:honeysql` follow HoneySQL rules: `[:= :x nil]` compiles to 
 
 | Family | Tags |
 |---|---|
-| Composition | `:sequential`, `:parallel`, `:skip`, `:block`, `:factory`, `:lambda` |
+| Composition | `:sequential`, `:parallel`, `:skip`, `:graph`, `:block`, `:factory`, `:lambda` |
 | Dense | `:linear`, `:dropout`, `:flatten` |
 | Activations | `:activation`, `:relu`, `:relu6`, `:tanh`, `:sigmoid`, `:gelu`, `:selu`, `:mish`, `:softplus`, `:softsign`, `:prelu`, `:identity`, `:leaky-relu`, `:elu`, `:swish` |
 | Convolution | `:conv1d`, `:conv2d`, `:conv3d`, `:conv1d-transpose`, `:conv2d-transpose` |
@@ -306,6 +318,24 @@ The per-tag builders in `src/garun/blocks.clj` define the full option contracts.
 DJL 0.36 orders biased bidirectional RNN/GRU/LSTM parameters differently from PyTorch's native contract. The `ai.djl.nn.recurrent.OrderedRecurrent` bridge reorders parameter objects during block construction to match PyTorch parameter layout, preserving native gradients and serialization compatibility.
 
 `nn/build` accepts either `:input-shape` (one sample shape; batch dimension 1 is prepended automatically) or `:input-shapes` (concrete DJL shapes for multi-input architectures). These options are mutually exclusive. `:dtype` defaults to `:float32`, `:device` defaults to `:cpu`, and `:engine` selects a DJL engine.
+
+### Graphs
+
+A graph declares its input and output names and routes tensors through named nodes:
+
+```clojure
+[:graph {:inputs [:left :right] :outputs [:output]}
+ [:joined [:left :right] [:concat {:axis 1}]]
+ [:output [:joined] [:linear 1]]]
+```
+
+`:inputs` and `:outputs` are nonempty keyword vectors. Input names are unique. Each node is `[name [dependencies] block]`, with a keyword name and a nonempty keyword dependency vector. Node names are unique and distinct from input names. Names identify single tensors, and each node block must produce exactly one tensor. Dependencies may refer to inputs or other nodes; nodes may appear in any order. Every node must contribute to a declared output. Output names may refer to inputs or nodes, and output tensors follow the declared order.
+
+Graph node blocks `[:concat {:axis n}]` and `[:add]` merge at least two dependencies. `[:concat]` defaults to axis `-1`; concatenation requires matching dimensions outside the chosen axis. `[:add]` performs elementwise addition with broadcasting. These merge tags are valid as graph node blocks. Referencing an earlier tensor alongside a later node creates a long skip connection.
+
+Malformed graph options or nodes, duplicate names, unknown references, dependency cycles, unused nodes, and invalid merge options throw an exception with `:error :nn/invalid-graph`. Tensor counts and incompatible shapes fail during initialization or forwarding.
+
+Graphs composed of serializable EDN blocks are serializable specifications; `nn/save!` and `nn/load` preserve their topology and parameters. Graphs containing native blocks or functions use the existing explicit reconstruction-spec policy.
 
 ## Training
 
@@ -335,7 +365,8 @@ DJL 0.36 orders biased bidirectional RNN/GRU/LSTM parameters differently from Py
 
 | Option | Meaning |
 |---|---|
-| `:x`, `:y` | Feature and label columns |
+| `:x` | One keyword vector for a single input, a vector of keyword vectors in network input order, or a map from graph input names to keyword vectors |
+| `:y` | Label column keyword or vector of label column keywords |
 | `:sequence` | Full windows of `:length` rows per `:partition-by`, ordered by `:order-by`; the label is the last row's `:y`. Input is `[windows length features]` |
 | `:standardize` | `[:x]`, `[:y]` or both. Mean and population standard deviation come from the training source only, in one DuckDB aggregate |
 | `:validation` | Another table source, or a DJL `Dataset` for native sources |
@@ -347,6 +378,10 @@ DJL 0.36 orders biased bidirectional RNN/GRU/LSTM parameters differently from Py
 | `:forward` | `(fn [trainer inputs training?] NDList)` replacing the forward pass |
 | `:config` | A native `TrainingConfig` overriding component options |
 
+For multi-input table training, `:x [[:horizontal :vertical] [:temperature]]` supplies two tensors in network input order. A graph with `:inputs [:position :measurements]` also accepts `:x {:position [:horizontal :vertical] :measurements [:temperature]}`. The map must contain exactly the graph's input names; map iteration order has no effect. Each group is a nonempty keyword vector and must match its input shape.
+
+All column groups and labels come from one table extraction, preserving row alignment. Tabular groups produce `[rows features]` tensors; with `:sequence`, every group uses the same windows and produces `[windows length features]`. `:standardize [:x]` computes training-only statistics for every feature group. The [multi-input training example](examples/garun/examples/training.clj) trains a graph on a sample-keyed held-out split, then evaluates and predicts using its stored column groups.
+
 `train!` returns a map of training metrics:
 
 ```clojure
@@ -356,7 +391,7 @@ DJL 0.36 orders biased bidirectional RNN/GRU/LSTM parameters differently from Py
  :stopped :completed}   ; or :early-stopping
 ```
 
-The input specification (`:x`, `:y`, `:sequence`, `:standardize`) and its computed statistics are stored with the network and serialized by `nn/save!`. `nn/predict` and `nn/evaluate` reuse these settings: features are scaled using training statistics, outputs return in original units, and evaluation aligns sequence windows with ground truth labels. Pass explicit `:x` or `:y` options to override them.
+The input specification (`:x`, `:y`, `:sequence`, `:standardize`) and its computed statistics are stored with the network and serialized by `nn/save!`. Named graph groups are stored in declared network input order. `nn/predict` and `nn/evaluate` reuse these settings, including all input groups when `:x` is omitted: features are scaled using training statistics, outputs return in original units, and evaluation aligns sequence windows with ground truth labels. Pass explicit `:x` or `:y` options to override them.
 
 `train!` is implemented as a loop over `nn/epoch!`. You can drive this loop directly for custom schedules or stopping rules:
 

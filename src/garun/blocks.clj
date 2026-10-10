@@ -24,7 +24,7 @@
             BertPretrainingBlock IdEmbedding$Builder ScaledDotProductAttentionBlock]
            [ai.djl.modality.nlp DefaultVocabulary Vocabulary]
            [ai.djl.modality.nlp.embedding TrainableWordEmbedding TrainableWordEmbedding$Builder]
-           [garun.djl FnBlock MaskedTransformerEncoder TransposeConvolution]
+           [garun.djl FnBlock GraphBlock MaskedTransformerEncoder TransposeConvolution]
            [java.util Collection List]
            [java.util.function Function]))
 
@@ -158,6 +158,82 @@
                                     (mapv (fn [shapes] (mapv (fn [^Shape s] (vec (.getShape s))) shapes))
                                           child-shapes)
                                     (mapv (fn [^Shape s] (vec (.getShape s))) input-shapes)))))))))
+
+(defn- graph-order [nodes inputs]
+  (loop [remaining nodes available (set inputs) ordered []]
+    (if (empty? remaining)
+      ordered
+      (let [ready (filterv (fn [[_ dependencies]] (every? available dependencies)) remaining)
+            ready-names (set (map first ready))]
+        (when (empty? ready)
+          (invalid :nn/invalid-graph "Graph contains a dependency cycle"
+                   {:nodes (mapv first remaining)}))
+        (recur (filterv #(not (ready-names (first %))) remaining)
+               (into available ready-names)
+               (into ordered ready))))))
+
+(defn- graph-merge-options [node-name dependencies spec]
+  (let [[tag & arguments] spec
+        options (if (= tag :concat) (if (empty? arguments) {} (first arguments)) {})
+        axis (get options :axis -1)]
+    (when-not (and (<= 2 (count dependencies))
+                   (if (= tag :concat)
+                     (and (<= (count arguments) 1) (map? options)
+                          (every? #{:axis} (keys options))
+                          (integer? axis) (<= Integer/MIN_VALUE axis Integer/MAX_VALUE))
+                     (empty? arguments)))
+      (invalid :nn/invalid-graph "Graph merge requires at least two inputs and valid options"
+               {:node node-name :spec spec :inputs dependencies}))
+    axis))
+
+(defn- graph! [arguments]
+  (let [[options & nodes] arguments
+        {:keys [inputs outputs]} (when (map? options) options)]
+    (when-not (and (map? options) (every? #{:inputs :outputs} (keys options))
+                   (vector? inputs) (seq inputs) (every? keyword? inputs)
+                   (= (count inputs) (count (set inputs)))
+                   (vector? outputs) (seq outputs) (every? keyword? outputs))
+      (invalid :nn/invalid-graph "Graph requires nonempty keyword :inputs/:outputs and unique inputs"
+               {:options options}))
+    (doseq [node nodes]
+      (when-not (and (vector? node) (= 3 (count node)) (keyword? (first node))
+                     (vector? (second node)) (seq (second node))
+                     (every? keyword? (second node)))
+        (invalid :nn/invalid-graph "Graph node must be [name [input names] block]"
+                 {:node node})))
+    (let [node-names (mapv first nodes)
+          names (into (set inputs) node-names)]
+      (when-not (= (count names) (+ (count inputs) (count node-names)))
+        (invalid :nn/invalid-graph "Graph node names must be unique and distinct from inputs"
+                 {:inputs inputs :nodes node-names}))
+      (doseq [[node-name dependencies spec] nodes]
+        (when-let [unknown (seq (remove names dependencies))]
+          (invalid :nn/invalid-graph "Graph node references unknown inputs"
+                   {:node node-name :names (vec unknown)}))
+        (when (and (vector? spec) (#{:concat :add} (first spec)))
+          (graph-merge-options node-name dependencies spec)))
+      (when-let [unknown (seq (remove names outputs))]
+        (invalid :nn/invalid-graph "Graph outputs reference unknown names" {:names (vec unknown)}))
+      (let [ordered (graph-order (vec nodes) inputs)
+            contributing (reduce (fn [needed [node-name dependencies]]
+                                   (if (needed node-name) (into needed dependencies) needed))
+                                 (set outputs) (rseq ordered))
+            unused (filterv #(not (contributing %)) node-names)
+            indices (zipmap (into inputs (map first ordered)) (range))]
+        (when (seq unused)
+          (invalid :nn/invalid-graph "Graph nodes must contribute to a declared output"
+                   {:nodes unused}))
+        (GraphBlock.
+         (int (count inputs))
+         ^List (mapv (comp str first) ordered)
+         ^List (mapv (fn [[_ dependencies]] (int-array (map indices dependencies))) ordered)
+         ^List (mapv (fn [[node-name dependencies spec]]
+                       (if (and (vector? spec) (#{:concat :add} (first spec)))
+                         (GraphBlock/merge (name (first spec))
+                                           (int (graph-merge-options node-name dependencies spec)))
+                         (compile-block spec)))
+                     ordered)
+         (int-array (map indices outputs)))))))
 
 (defn- linear! [args spec]
   (let [arg (first args)
@@ -509,7 +585,10 @@
   :factory is invoked on each compilation and must return a fresh Block when used
   by distinct owners. Pool/convolution spatial vectors exclude batch/channels;
   reshape/transpose vectors describe the full tensor, including batch. Index uses
-  DJL's NDIndex string grammar unchanged and borrows its singleton input."
+  DJL's NDIndex string grammar unchanged and borrows its singleton input.
+  :graph takes {:inputs [names] :outputs [names]} and [name [dependencies] block]
+  nodes in any order. Names identify single arrays; :concat (optional :axis,
+  default -1) and :add merge two or more arrays only as graph node blocks."
   ^Block [spec]
   (if (instance? Block spec)
     spec
@@ -521,6 +600,7 @@
           (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec}))
         (case tag
           :sequential (sequential! arguments)
+          :graph (graph! arguments)
           :linear (linear! arguments spec)
           :activation (do
                         (when-not (= 1 (count arguments))
@@ -577,6 +657,12 @@
        (let [[tag & args] spec]
          (cond
            (= tag :sequential) (every? serializable-spec? args)
+           (= tag :graph)
+           (every? (fn [[_ _ block]]
+                     (if (and (vector? block) (#{:concat :add} (first block)))
+                       true
+                       (serializable-spec? block)))
+                   (rest args))
            (#{:parallel :skip} tag)
            (and (map? (first args)) (#{:add :concat} (:combine (first args)))
                 (seq (rest args)) (every? serializable-spec? (rest args)))

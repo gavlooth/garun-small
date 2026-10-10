@@ -256,6 +256,9 @@
   sources and arrays remain borrowed. :config accepts native TrainingConfig.
   :x/:y/:sequence default to stored inputs; training always recomputes requested
   standardization from this training source, using one DuckDB aggregate query.
+  :x accepts a keyword vector for one input, a vector of keyword vectors in
+  network input order, or a map keyed by graph input names for graph networks.
+  All groups and labels share one extraction and identical sequence windows.
 
   Pass {} as the initial epoch! state. Epoch state is immutable and returned;
   best tensors live device-natively on this handle, not in Clojure accumulators.
@@ -514,8 +517,7 @@
     []
     (let [^Model model (:model network)]
       (with-open [^NDManager manager (.newSubManager (.getNDManager model))]
-        (let [features (examples/standardized-array manager (:features examples)
-                                                    (get-in specification [:statistics :x]) false)]
+        (let [features (examples/feature-arrays manager examples specification)]
           (with-open [^NDList result (predict-native network features {:manager manager} (context/manager context))]
             (when-not (= 1 (.size result))
               (invalid :nn/non-tabular-output "Table predictions require a single output tensor"
@@ -541,6 +543,8 @@
   with train-only statistics and raw outputs are restored to original units.
   :class applies argmax/zero threshold; :probability applies softmax/sigmoid.
   Sequence tables yield one prediction per full window, in partition/order order.
+  :x accepts one keyword vector, ordered column groups, or graph-name groups;
+  omitted :x reuses the stored groups in network input order.
 
   Otherwise inputs are NDList, tensors or tensor descriptors. Return independent
   tensors in an NDList owned by :manager, defaulting to context's manager. Inputs
@@ -580,8 +584,7 @@
         ^Model model (:model network)]
     (examples/label-layout! network prepared loss-tag)
     (with-open [^NDManager manager (.newSubManager (.getNDManager model))]
-      (let [features (examples/standardized-array manager (:features prepared)
-                                                  (get-in specification [:statistics :x]) false)
+      (let [features (examples/feature-arrays manager prepared specification)
             labels (examples/standardized-array manager (:labels prepared)
                                                 (get-in specification [:statistics :y]) (= loss-tag :ce))]
         (with-open [^NDList result (predict-native network features {:manager manager} (context/manager context))]
@@ -599,7 +602,8 @@
   of :mse/:mae/:r2/:accuracy/:precision/:recall/:f1/:log-loss or custom functions.
   Return {:loss number, metric-key number, ...}; loss retains DJL's training-scale
   semantics, while regression metrics/predictions use original target units.
-  :loss overrides the saved loss (required to reproduce a custom/native loss)."
+  :loss overrides the saved loss (required to reproduce a custom/native loss).
+  :x accepts one keyword vector, ordered column groups, or graph-name groups."
   [^Context context network source options]
   (let [native? (instance? Dataset source)]
     ((if native? session/exclusive session/shared)

@@ -667,3 +667,166 @@
       (is (every? #(< (Math/abs (double %)) 1.0e-4)
                   (map - (.toFloatArray output) [-1 1 -1 1])))
       (is (some #(not (zero? %)) (:gradients result))))))
+
+(def ^:private image-measurements-graph
+  [:graph {:inputs [:image :measurements] :outputs [:logits]}
+   [:features [:image]
+    [:sequential [:conv2d {:filters 8 :kernel [3 3]}] [:relu] [:global-avg-pool2d]]]
+   [:joined [:features :measurements] [:concat {:axis 1}]]
+   [:hidden [:joined] [:sequential [:linear 32] [:relu]]]
+   [:logits [:hidden] [:linear 3]]])
+
+(deftest graph-network-shapes-and-save-load
+  (let [directory (.toFile (Files/createTempDirectory "garun-graph-" (make-array FileAttribute 0)))]
+    (try
+      (with-open [current-session (session/open)]
+        (let [^NDManager manager (context/manager current-session)
+              network (nn/build current-session image-measurements-graph
+                                {:input-shapes [[1 1 8 8] [1 4]]})
+              ^Block block (.getBlock ^ai.djl.Model (:model network))
+              image (.ones manager (Shape. (long-array [2 1 8 8])))
+              measurements (.ones manager (Shape. (long-array [2 4])))
+              inputs (NDList. ^"[Lai.djl.ndarray.NDArray;"
+                      (into-array NDArray [image measurements]))]
+          (is (blocks/serializable-spec? image-measurements-graph))
+          (is (= [[2 3]] (shape-vectors (.getOutputShapes block (.getShapes inputs)))))
+          (nn/save! current-session network directory)
+          (let [restored (nn/load current-session directory)]
+            (with-open [^NDList before (nn/predict current-session network inputs {})
+                        ^NDList after (nn/predict current-session restored inputs {})]
+              (is (= image-measurements-graph (:spec restored)))
+              (is (= [[1 1 8 8] [1 4]] (:input-shapes restored)))
+              (is (= [[2 3]] (shape-vectors (.getShapes before))
+                     (shape-vectors (.getShapes after))))
+              (is (.allClose (.head before) (.head after) 0.0 0.0 false))))
+          (is (not (.isReleased image)))
+          (is (not (.isReleased measurements)))))
+      (finally
+        (doseq [^File file (reverse (file-seq directory))] (.delete file))))))
+
+(deftest graph-out-of-order-skips-output-order-and-every-node-gradient
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (let [spec [:graph {:inputs [:input] :outputs [:sum :second :input]}
+                [:sum [:third :first] [:add]]
+                [:third [:second] [:linear {:units 3 :bias? false}]]
+                [:second [:first] [:linear {:units 3 :bias? false}]]
+                [:first [:input] [:linear {:units 3 :bias? false}]]]
+          input (.create manager (float-array [1 2 3 4]) (Shape. (long-array [2 2])))
+          inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [input]))
+          ^Block block (initialize! spec manager inputs)]
+      (doseq [^Parameter parameter (.values (.getParameters block))]
+        (.set (.getArray parameter) (float-array (repeat (.size (.getArray parameter)) 1))))
+      (let [^NDList outputs
+            (with-open [^GradientCollector collector (.newGradientCollector (.getEngine manager))]
+              (let [^NDList outputs (.forward block (ParameterStore. manager false) inputs true)]
+                (.backward collector (.sum (.head outputs)))
+                outputs))
+            ^NDList restored (parameter-roundtrip! spec manager inputs block)]
+        (is (= [[2 3] [2 3] [2 2]] (shape-vectors (.getShapes outputs))
+               (shape-vectors (.getOutputShapes block (.getShapes inputs)))))
+        (is (= [30.0 30.0 30.0 70.0 70.0 70.0]
+               (vec (.toFloatArray ^NDArray (.get outputs 0)))))
+        (is (= [9.0 9.0 9.0 21.0 21.0 21.0]
+               (vec (.toFloatArray ^NDArray (.get outputs 1)))))
+        (is (identical? input (.get outputs 2)))
+        (is (= 3 (.size (.getParameters block))))
+        (doseq [^Parameter parameter (.values (.getParameters block))]
+          (testing (.getName parameter)
+            (is (.hasGradient (.getArray parameter)))
+            (let [gradient (vec (.toFloatArray (.getGradient (.getArray parameter))))]
+              (is (every? #(Double/isFinite (double %)) gradient))
+              (is (every? pos? gradient)))))
+        (doseq [index (range (.size outputs))]
+          (is (.allClose ^NDArray (.get outputs (int index))
+                         ^NDArray (.get restored (int index)) 0.0 0.0 false)))
+        (is (blocks/serializable-spec? spec))
+        (is (not (.isReleased input)))))))
+
+(deftest graph-default-concat-add-broadcasting-and-input-only-outputs
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (let [left (.ones manager (Shape. (long-array [2 3])))
+          right (.ones manager (Shape. (long-array [2 1])))
+          inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [left right]))]
+      (doseq [[spec expected]
+              [[[:graph {:inputs [:left :right] :outputs [:joined]}
+                 [:joined [:left :right :right] [:concat]]] [[2 5]]]
+               [[:graph {:inputs [:left :right] :outputs [:sum]}
+                 [:sum [:left :right :right] [:add]]] [[2 3]]]
+               [[:graph {:inputs [:left :right] :outputs [:right :left :right]}]
+                [[2 1] [2 3] [2 1]]]]]
+        (let [^Block block (initialize! spec manager inputs)
+              ^NDList output (.forward block (ParameterStore. manager false) inputs false)]
+          (is (= expected (shape-vectors (.getOutputShapes block (.getShapes inputs)))
+                 (shape-vectors (.getShapes output))))
+          (is (blocks/serializable-spec? spec))
+          (is (not (.isReleased left)))
+          (is (not (.isReleased right))))))))
+
+(deftest graph-native-multiinput-nodes-receive-their-dependencies-in-order
+  (with-open [manager (NDManager/newBaseManager (Device/cpu) "PyTorch")]
+    (let [left (.ones manager (Shape. (long-array [2 3])))
+          right (.ones manager (Shape. (long-array [2 1])))
+          inputs (NDList. ^"[Lai.djl.ndarray.NDArray;" (into-array NDArray [left right]))
+          ^Block native
+          (blocks/compile-block
+           [:lambda (fn [^NDList inputs]
+                      (NDList. ^"[Lai.djl.ndarray.NDArray;"
+                       (into-array NDArray [(.sub ^NDArray (.get inputs 0)
+                                                  ^NDArray (.get inputs 1))])))])
+          spec [:graph {:inputs [:left :right] :outputs [:difference]}
+                [:difference [:right :left] native]]
+          ^Block block (initialize! spec manager inputs)
+          ^NDList output (.forward block (ParameterStore. manager false) inputs false)]
+      (is (= [[2 1] [2 3]] (shape-vectors (.getInputShapes native))))
+      (is (= [[2 3]] (shape-vectors (.getShapes output))
+             (shape-vectors (.getOutputShapes block (.getShapes inputs)))))
+      (is (every? zero? (.toFloatArray (.head output))))
+      (is (not (blocks/serializable-spec? spec)))
+      (is (not (blocks/serializable-spec?
+                [:graph {:inputs [:input] :outputs [:output]}
+                 [:output [:input] [:lambda identity]]]))))))
+
+(deftest graph-rejects-invalid-options-names-dependencies-cycles-and-merges
+  (doseq [spec
+          [[:graph]
+           [:graph nil]
+           [:graph {:inputs [:input] :outputs [:input] :typo true}]
+           [:graph {:inputs [] :outputs [:output]}]
+           [:graph {:inputs [:input] :outputs []}]
+           [:graph {:inputs '(:input) :outputs [:input]}]
+           [:graph {:inputs [:input] :outputs '(:input)}]
+           [:graph {:inputs ["input"] :outputs [:input]}]
+           [:graph {:inputs [:input] :outputs ["input"]}]
+           [:graph {:inputs [:input :input] :outputs [:input]}]
+           [:graph {:inputs [:input] :outputs [:missing]}]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [:missing] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:input]} [:input [:input] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input] [:identity]] [:output [:input] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [:output] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:a]}
+            [:a [:b] [:identity]] [:b [:a] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:input]} [:unused [:input] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} ["output" [:input] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output '(:input) [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output ["input"] [:identity]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [:input]]]
+           [:graph {:inputs [:input] :outputs [:output]} '(:output [:input] [:identity])]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [:input] [:add]]]
+           [:graph {:inputs [:input] :outputs [:output]} [:output [:input] [:concat]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:add {}]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:concat nil]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:concat {:axis 1.5}]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:concat {:axis 2147483648}]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:concat {:typo 1}]]]
+           [:graph {:inputs [:input] :outputs [:output]}
+            [:output [:input :input] [:concat {} {}]]]]]
+    (is (= :nn/invalid-graph (error-key #(blocks/compile-block spec))) (pr-str spec)))
+  (doseq [spec [[:concat] [:add] [:sequential [:concat]]]]
+    (is (= :nn/unknown-tag (error-key #(blocks/compile-block spec))) (pr-str spec))))

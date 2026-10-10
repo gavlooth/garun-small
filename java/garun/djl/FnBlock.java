@@ -157,14 +157,14 @@ public final class FnBlock extends AbstractBlock {
             }
             for (int output = 0; output < count; output++) {
                 result[output] = "concat".equals(mode)
-                        ? concatShape(result[output], next[output])
+                        ? concatShape(result[output], next[output], axis)
                         : broadcastShape(result[output], next[output]);
             }
         }
         return result;
     }
 
-    private Shape concatShape(Shape left, Shape right) {
+    static Shape concatShape(Shape left, Shape right, int axis) {
         long[] dims = left.getShape().clone();
         long[] other = right.getShape();
         int dimension = axis < 0 ? axis + dims.length : axis;
@@ -180,7 +180,7 @@ public final class FnBlock extends AbstractBlock {
         return new Shape(dims);
     }
 
-    private static Shape broadcastShape(Shape left, Shape right) {
+    static Shape broadcastShape(Shape left, Shape right) {
         long[] a = left.getShape();
         long[] b = right.getShape();
         long[] result = new long[Math.max(a.length, b.length)];
