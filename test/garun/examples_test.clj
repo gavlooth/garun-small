@@ -52,8 +52,15 @@
                  [:multiclass training/multiclass-data training/multiclass-partitions]
                  [:regression training/regression-data training/regression-partitions]
                  [:multi-input training/multi-input-data training/multi-input-partitions]]))
+        battery-hybrid-rows
+        (with-open [current-session (session/open)]
+          (mapv #(table/rows current-session %) training/battery-hybrid-partitions))
         elapsed-milliseconds (/ (- (System/nanoTime) started) 1.0e6)]
     (println (format "Gallery examples runtime: %.1f ms" elapsed-milliseconds))
+    (prn {:battery-hybrid
+          {:epochs (count (get-in training-summary [:battery-hybrid :history]))
+           :best (get-in training-summary [:battery-hybrid :best])
+           :test-mae (get-in training-summary [:battery-hybrid :evaluation :mae])}})
 
     (testing "Table pipelines preserve data, partition keys and persisted values"
       (let [{:keys [rows totals left semi-count anti-count split-rows sample sample-again
@@ -100,8 +107,29 @@
           (is (empty? (apply set/intersection partition-keys)) (name example))
           (is (= partition-keys reordered-keys) (name example)))))
 
+    (testing "Hybrid battery partitions keep whole batteries in disjoint held-out sets"
+      (let [battery-keys (mapv #(set (map :battery_id %)) battery-hybrid-rows)]
+        (is (every? seq battery-hybrid-rows))
+        (is (= 384 (reduce + (map count battery-hybrid-rows))))
+        (is (= (set (range 32)) (apply set/union battery-keys)))
+        (is (every? empty? (for [left (range 3) right (range (inc left) 3)]
+                             (set/intersection (nth battery-keys left) (nth battery-keys right)))))))
+
+    (testing "The hybrid graph predicts one finite value per held-out test window"
+      (let [length (get-in training/battery-hybrid-options [:sequence :length])
+            test-batteries (vals (group-by :battery_id (last battery-hybrid-rows)))
+            test-windows (reduce + (map #(max 0 (inc (- (count %) length))) test-batteries))
+            {:keys [history predictions evaluation best]} (:battery-hybrid training-summary)]
+        (is (= test-windows (count predictions)))
+        (is (pos? test-windows))
+        (is (every? finite? predictions))
+        (is (= #{:loss :mae} (set (keys evaluation))))
+        (is (finite? (:mae evaluation)))
+        (is (= :validation-loss (:monitor best)))
+        (is (every? #(= #{:mae} (set (keys (:metrics %)))) history))))
+
     (testing "Short training runs produce finite, decreasing losses"
-      (doseq [example [:binary :multiclass :regression :multi-input :sequence :custom]]
+      (doseq [example [:binary :multiclass :regression :multi-input :sequence :battery-hybrid :custom]]
         (let [history (get-in training-summary [example :history])]
           (is (<= 2 (count history) 8) (name example))
           (is (every? finite? (map :training-loss history)) (name example))

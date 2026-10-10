@@ -27,6 +27,43 @@ garun-small is an experimental Clojure library for data preparation and deep lea
     (nn/evaluate current-session :regressor test {:metrics [:mae :mse]})))
 ```
 
+## A larger example: two inputs, a graph and sequences
+
+The [battery-hybrid story](examples/garun/examples/training.clj) generates 32 synthetic batteries with 12 cycles each, per-cycle measurements and battery attributes repeated on every row. A keyed split keeps all rows for each battery in one of the training, validation or test partitions. Sequence preparation creates history windows with shape `[N,T,F] = [N,4,3]` and static windows `[N,4,2]`; the GRU branch and the static branch each use `[:index ":, -1"]` to select the last step. The graph concatenates a 16-value history encoding and an 8-value static context, then adds two `[N,24]` tensors through the residual edge. Training learns scaling from training rows, restores the best validation epoch and evaluates test MAE in remaining-life units.
+
+```clojure
+(require '[garun.examples.training :as training])
+
+(with-open [current-session (session/open {:seed 7 :device :cpu})]
+  (let [readings (table/from training/battery-hybrid-data)
+        [training-batteries validation-batteries test-batteries]
+        (table/query readings
+                     [:split {:fractions [0.7 0.15 0.15] :seed 7 :key :battery_id}])
+        network
+        [:graph {:inputs [:history :static] :outputs [:remaining]}
+         [:encoded [:history]
+          [:sequential [:gru {:state-size 16 :batch-first? true}] [:index ":, -1"]]]
+         [:context [:static]
+          [:sequential [:index ":, -1"] [:linear 8] [:relu]]]
+         [:joined [:encoded :context] [:concat {:axis 1}]]
+         [:hidden [:joined] [:sequential [:linear 24] [:relu]]]
+         [:residual [:hidden :joined] [:add]]
+         [:remaining [:residual] [:linear 1]]]]
+    (nn/build current-session network
+              {:input-shapes [[1 4 3] [1 4 2]] :name :battery-hybrid})
+    (nn/train! current-session :battery-hybrid training-batteries
+               {:x {:history [:voltage :temperature :capacity]
+                    :static [:nominal_capacity :resistance]}
+                :y :remaining_life
+                :sequence {:length 4 :partition-by :battery_id :order-by :cycle}
+                :standardize [:x :y] :loss :mse
+                :optim [:adam {:lr 0.03}] :epochs 8 :batch 256 :shuffle? false
+                :early-stopping {:patience 3 :min-delta 0.0001 :restore-best? true}
+                :metrics [:mae] :validation validation-batteries})
+    {:test (nn/evaluate current-session :battery-hybrid test-batteries {:metrics [:mae]})
+     :predictions (nn/predict current-session :battery-hybrid test-batteries {})}))
+```
+
 A session manages a DuckDB connection, a root tensor manager, and registered resources (tables, networks, models, and trainers). Closing the session closes these resources together. `nn/train!` executes the training loop, including sequence windowing, training-set feature standardization, early stopping, and epoch metrics observation.
 
 Garun is a thin layer over DJL and DuckDB. The full DJL API (blocks, trainers, tensors, model zoo, and translators) and DuckDB SQL engine (file formats, window functions, and joins) remain directly accessible. Functions accepting Hiccup specifications also accept native DJL objects. HoneySQL maps and raw SQL strings expose DuckDB operations beyond built-in query clauses.
@@ -92,7 +129,7 @@ The example namespaces demonstrate query and model specifications using syntheti
 
 - [Tables](examples/garun/examples/tables.clj): expressions, HoneySQL CASE, aggregations, running window functions, left/semi/anti joins, keyed splits, seeded sampling, table materialization, and a Parquet round trip.
 - [Networks](examples/garun/examples/networks.clj): 16 runnable specs: MLP, residual, Inception, CNN, image-and-measurements graph classifier, long-skip graph, sequence convolution, convolutional autoencoder, GRU, LSTM, bidirectional LSTM, embedding/text classifier, transformer classifier, attention, NDArray lambda, and custom parallel layers.
-- [Training](examples/garun/examples/training.clj): BCE and CE classification, regression, and multi-input graph training with deterministic validation splits, feature standardization, sequence windows, early stopping, epoch observers, custom training loops, and model persistence.
+- [Training](examples/garun/examples/training.clj): BCE and CE classification, regression, multi-input graph training and a two-input battery graph with held-out validation and test batteries, feature standardization, sequence windows, early stopping, epoch observers, custom training loops, and model persistence.
 
 Each file exposes `(run!)`, returning a data summary, and `-main`, printing and returning it. `garun.examples-test` runs all three and verifies output shapes, decreasing losses, keyed split boundaries, and persistence.
 

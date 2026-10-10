@@ -1,11 +1,11 @@
 (ns garun.examples.training
-  "Six small CPU training stories: binary and multiclass logits, standardized
-  regression, a multi-input graph, partitioned battery sequences with early
-  stopping and a custom epoch loop. A model save/load round trip preserves
-  regression predictions. DuckDB range() generates all data without downloads.
+  "Seven small CPU training stories: binary and multiclass logits, standardized
+  regression, a multi-input graph, partitioned battery sequences, a hybrid battery
+  graph and a custom epoch loop. A model save/load round trip preserves regression
+  predictions. DuckDB range() generates all data without downloads.
   Trusted SQL only generates rows; Garun Hiccup selects and splits them.
   Tabular examples use seeded, sample-keyed held-out validation; the battery
-  example holds out whole batteries."
+  examples hold out whole batteries."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
             [garun.nn :as nn]
@@ -82,6 +82,42 @@
    :early-stopping {:patience 2 :min-delta 0.0001 :restore-best? true}
    :metrics [:mae]})
 
+(def battery-hybrid-data
+  [:duckdb {:query (str "SELECT i // 12 AS battery_id, i % 12 AS cycle, "
+                        "4.2 - (i % 12) * 0.03 - (i // 12 % 4) * 0.01 AS voltage, "
+                        "20.0 + (i % 12) * 0.4 + (i // 12 % 5) * 0.3 AS temperature, "
+                        "2.0 + (i // 12 % 6) * 0.05 - (i % 12) * 0.02 AS capacity, "
+                        "2.0 + (i // 12 % 6) * 0.05 AS nominal_capacity, "
+                        "0.05 + (i // 12 % 4) * 0.005 AS resistance, "
+                        "24.0 + (i // 12 % 6) * 0.8 "
+                        "- (i % 12) * (1.0 + (i // 12 % 4) * 0.05) AS remaining_life "
+                        "FROM range(384) AS readings(i)")}])
+
+(def battery-hybrid-partitions
+  (table/query battery-hybrid-data
+               [:split {:fractions [0.7 0.15 0.15] :seed 7 :key :battery_id}]))
+
+(def battery-hybrid-network
+  [:graph {:inputs [:history :static] :outputs [:remaining]}
+   [:encoded [:history]
+    [:sequential [:gru {:state-size 16 :batch-first? true}] [:index ":, -1"]]]
+   [:context [:static]
+    [:sequential [:index ":, -1"] [:linear 8] [:relu]]]
+   [:joined [:encoded :context] [:concat {:axis 1}]]
+   [:hidden [:joined] [:sequential [:linear 24] [:relu]]]
+   [:residual [:hidden :joined] [:add]]
+   [:remaining [:residual] [:linear 1]]])
+
+(def battery-hybrid-options
+  {:x {:history [:voltage :temperature :capacity]
+       :static [:nominal_capacity :resistance]}
+   :y :remaining_life
+   :sequence {:length 4 :partition-by :battery_id :order-by :cycle}
+   :standardize [:x :y] :loss :mse
+   :optim [:adam {:lr 0.03}] :epochs 8 :batch 256 :shuffle? false
+   :early-stopping {:patience 3 :min-delta 0.0001 :restore-best? true}
+   :metrics [:mae]})
+
 (defn- custom-training!
   "Drive immutable epoch state ourselves; epoch! does not apply :stop? for us."
   [current-session]
@@ -103,12 +139,14 @@
         (session/release! current-session handle)))))
 
 (defn run!
-  "Train all six examples and return losses, predictions, metrics and persistence evidence."
+  "Train all seven examples and return losses, predictions, metrics and persistence evidence."
   []
   (let [[binary-training binary-validation] binary-partitions
         [multiclass-training multiclass-validation] multiclass-partitions
         [regression-training regression-validation] regression-partitions
         [multi-input-training multi-input-validation] multi-input-partitions
+        [battery-hybrid-training battery-hybrid-validation battery-hybrid-test]
+        battery-hybrid-partitions
         directory (str (Files/createTempDirectory "garun-gallery-model-"
                                                   (make-array FileAttribute 0)))]
     (try
@@ -163,6 +201,17 @@
               sequence-result (nn/train! current-session sequence-network training-batteries
                                          (assoc battery-options :validation validation-batteries))
               sequence-predictions (nn/predict current-session :battery validation-batteries {})
+
+              ;; Both inputs share cycle windows; the static branch selects repeated attributes.
+              hybrid-network (nn/build current-session battery-hybrid-network
+                                       {:input-shapes [[1 4 3] [1 4 2]] :name :battery-hybrid})
+              hybrid-result (nn/train! current-session hybrid-network battery-hybrid-training
+                                       (assoc battery-hybrid-options
+                                              :validation battery-hybrid-validation))
+              hybrid-evaluation (nn/evaluate current-session :battery-hybrid battery-hybrid-test
+                                             {:metrics [:mae]})
+              hybrid-predictions (nn/predict current-session :battery-hybrid battery-hybrid-test {})
+
               custom-result (custom-training! current-session)]
           ;; Save both weights and standardization; loading needs no feature overrides.
           (nn/save! current-session :regression directory)
@@ -179,6 +228,8 @@
            :sequence (assoc sequence-result :predictions sequence-predictions
                             :evaluation (nn/evaluate current-session :battery validation-batteries
                                                      {:metrics [:mae]}))
+           :battery-hybrid (assoc hybrid-result :predictions hybrid-predictions
+                                  :evaluation hybrid-evaluation)
            :custom custom-result
            :persistence {:before regression-predictions
                          :after (nn/predict current-session :restored regression-validation {})}}))
