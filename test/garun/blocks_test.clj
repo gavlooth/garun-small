@@ -830,3 +830,41 @@
     (is (= :nn/invalid-graph (error-key #(blocks/compile-block spec))) (pr-str spec)))
   (doseq [spec [[:concat] [:add] [:sequential [:concat]]]]
     (is (= :nn/unknown-tag (error-key #(blocks/compile-block spec))) (pr-str spec))))
+
+(defmethod blocks/compile-tag ::bottleneck [_ arguments spec]
+  (let [{:keys [units]} (first arguments)]
+    (when-not (and (= 1 (count arguments)) (pos-int? units))
+      (throw (ex-info "Bottleneck requires positive :units" {:error :nn/invalid-spec :spec spec})))
+    (blocks/compile-block [:sequential [:linear (quot units 2)] [:relu] [:linear units]])))
+
+(defmethod blocks/serializable-arguments? ::bottleneck [_ arguments]
+  (map? (first arguments)))
+
+(defmethod blocks/compile-tag ::rebuilt-by-caller [_ _ _]
+  (blocks/compile-block [:linear 2]))
+
+(deftest caller-defined-tags-compile-nest-and-persist-like-built-in-ones
+  (let [directory (.toFile (Files/createTempDirectory "garun-tag-" (make-array FileAttribute 0)))
+        spec [:sequential [::bottleneck {:units 6}] [:skip {:combine :add} [::bottleneck {:units 6}]]]]
+    (try
+      (with-open [current-session (session/open)]
+        (let [^NDManager manager (context/manager current-session)
+              network (nn/build current-session spec {:input-shape [4]})
+              inputs (NDList. ^"[Lai.djl.ndarray.NDArray;"
+                      (into-array NDArray [(.ones manager (Shape. (long-array [3 4])))]))]
+          (is (blocks/serializable-spec? spec))
+          (is (= :nn/invalid-spec (error-key #(blocks/compile-block [::bottleneck {:units 0}]))))
+          (is (= :nn/unknown-tag (error-key #(blocks/compile-block [::undefined {:units 6}]))))
+          (is (not (blocks/serializable-spec? [::undefined {:units 6}])))
+          ;; A tag without a serializable-arguments? method compiles but needs :spec to load.
+          (is (instance? Linear (blocks/compile-block [::rebuilt-by-caller])))
+          (is (not (blocks/serializable-spec? [:sequential [::rebuilt-by-caller]])))
+          (nn/save! current-session network directory)
+          (let [restored (nn/load current-session directory)]
+            (with-open [^NDList before (nn/predict current-session network inputs {})
+                        ^NDList after (nn/predict current-session restored inputs {})]
+              (is (= spec (:spec restored)))
+              (is (= [[3 6]] (shape-vectors (.getShapes before)) (shape-vectors (.getShapes after))))
+              (is (.allClose (.head before) (.head after) 0.0 0.0 false))))))
+      (finally
+        (doseq [^File file (reverse (file-seq directory))] (.delete file))))))

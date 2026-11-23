@@ -7,7 +7,12 @@
   must be value-independent; :shape-fn can describe dtype/value-sensitive outputs
   without allocating probe tensors. Caller functions must preserve input ownership.
   [:index \"DJL NDIndex string\"] borrows a singleton input and applies DJL indexing,
-  including slices, steps, negative indices and ellipses, without rewriting the string."
+  including slices, steps, negative indices and ellipses, without rewriting the string.
+
+  Each tag is one compile-tag method, with a serializable-arguments? method when
+  its spec can be rebuilt from EDN. A block of your own is the same two methods
+  on a namespaced tag; a saved network using it loads once that namespace is
+  loaded."
   (:import [ai.djl.ndarray NDArray NDArrays NDList]
            [ai.djl.ndarray.types Shape SparseFormat]
            [ai.djl.nn Activation Block Blocks LambdaBlock SequentialBlock]
@@ -568,17 +573,152 @@
                               result)))]
         (if singleton? (LambdaBlock/singleton function name) (LambdaBlock. function name))))))
 
-(def ^:private no-argument-tags
-  #{:relu :relu6 :tanh :sigmoid :gelu :selu :mish :softplus :softsign :prelu :identity
-    :flatten :global-max-pool1d :global-max-pool2d :global-max-pool3d
-    :global-avg-pool1d :global-avg-pool2d :global-avg-pool3d :bert-next-sentence})
+(defmulti compile-tag
+  "Compile one Hiccup block into a DJL Block. Dispatches on the tag; arguments
+  are the vector's remaining elements and spec is the whole vector, for error
+  data. Add a block of your own with (defmethod compile-tag ::my-block ...),
+  using a namespaced tag so it cannot collide with a later built-in."
+  (fn [tag _arguments _spec] tag))
 
-(def ^:private option-tags
-  #{:linear :activation :dropout :conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose
-    :max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d
-    :batchnorm :layernorm :ghost-batchnorm :embedding :word-embedding
-    :rnn :lstm :gru :attention :transformer-encoder :bert :bert-pretraining
-    :reshape :transpose :index :softmax :log-softmax :expand-dims :squeeze :leaky-relu :elu :swish})
+(defmethod compile-tag :default [tag _arguments _spec]
+  (invalid :nn/unknown-tag "Unknown neural network block" {:tag tag}))
+
+(defmulti serializable-arguments?
+  "Whether a block with this tag and these arguments is rebuilt from its spec
+  alone when a saved network loads. The whole spec is already known to be plain
+  EDN. Tags without a method are not: their networks need :spec again on load."
+  (fn [tag _arguments] tag))
+
+(defmethod serializable-arguments? :default [_tag _arguments] false)
+
+(declare serializable-spec?)
+
+(defn- no-arguments! [arguments spec]
+  (when (seq arguments)
+    (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec})))
+
+(defmethod compile-tag :sequential [_ arguments _]
+  (sequential! arguments))
+
+(defmethod serializable-arguments? :sequential [_ arguments]
+  (every? serializable-spec? arguments))
+
+(defmethod compile-tag :graph [_ arguments _]
+  (graph! arguments))
+
+(defmethod serializable-arguments? :graph [_ arguments]
+  (every? (fn [[_ _ block]]
+            (or (and (vector? block) (contains? #{:concat :add} (first block)))
+                (serializable-spec? block)))
+          (rest arguments)))
+
+(doseq [tag [:parallel :skip]]
+  (defmethod compile-tag tag [tag arguments spec]
+    (combination! tag arguments spec))
+  (defmethod serializable-arguments? tag [_ arguments]
+    (and (map? (first arguments))
+         (contains? #{:add :concat} (:combine (first arguments)))
+         (seq (rest arguments))
+         (every? serializable-spec? (rest arguments)))))
+
+(defmethod compile-tag :linear [_ arguments spec]
+  (linear! arguments spec))
+
+(defmethod compile-tag :activation [_ arguments spec]
+  (when-not (= 1 (count arguments))
+    (invalid :nn/invalid-spec "Activation requires one name" {:spec spec}))
+  (activation (first arguments)))
+
+(defmethod compile-tag :dropout [_ arguments spec]
+  (dropout! arguments spec))
+
+(doseq [tag [:relu :relu6 :tanh :sigmoid :gelu :selu :mish :softplus :softsign :prelu :identity]]
+  (defmethod compile-tag tag [tag arguments spec]
+    (no-arguments! arguments spec)
+    (activation tag)))
+
+(doseq [[tag block] {:flatten #(Blocks/batchFlattenBlock)
+                     :global-max-pool1d #(Pool/globalMaxPool1dBlock)
+                     :global-max-pool2d #(Pool/globalMaxPool2dBlock)
+                     :global-max-pool3d #(Pool/globalMaxPool3dBlock)
+                     :global-avg-pool1d #(Pool/globalAvgPool1dBlock)
+                     :global-avg-pool2d #(Pool/globalAvgPool2dBlock)
+                     :global-avg-pool3d #(Pool/globalAvgPool3dBlock)
+                     :bert-next-sentence #(BertNextSentenceBlock.)}]
+  (defmethod compile-tag tag [_ arguments spec]
+    (no-arguments! arguments spec)
+    (block)))
+
+(doseq [tag [:batchnorm :layernorm]]
+  (defmethod compile-tag tag [tag arguments _]
+    (normalization! tag (if (seq arguments) arguments [{}]))))
+
+(defmethod compile-tag :ghost-batchnorm [tag arguments _]
+  (normalization! tag arguments))
+
+(doseq [tag [:conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose]]
+  (defmethod compile-tag tag [tag arguments _]
+    (convolution! tag arguments)))
+
+(doseq [tag [:max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d]]
+  (defmethod compile-tag tag [tag arguments _]
+    (pooling! tag arguments)))
+
+(doseq [tag [:embedding :word-embedding :constant-embedding]]
+  (defmethod compile-tag tag [tag arguments _]
+    (embedding! tag arguments)))
+
+(doseq [tag [:rnn :lstm :gru]]
+  (defmethod compile-tag tag [tag arguments _]
+    (recurrent! tag arguments)))
+
+(doseq [tag [:attention :transformer-encoder]]
+  (defmethod compile-tag tag [tag arguments _]
+    (attention! tag arguments)))
+
+(doseq [tag [:bert :bert-pretraining]]
+  (defmethod compile-tag tag [tag arguments _]
+    (bert! tag arguments)))
+
+(defmethod compile-tag :index [_ arguments _]
+  (index! arguments))
+
+(doseq [tag [:reshape :transpose :softmax :log-softmax :expand-dims :squeeze]]
+  (defmethod compile-tag tag [tag arguments _]
+    (transform! tag arguments)))
+
+(doseq [tag [:leaky-relu :elu :swish]]
+  (defmethod compile-tag tag [tag arguments _]
+    (let [key (if (= tag :swish) :beta :alpha)
+          options (one-options arguments #{key} tag)
+          value (get options key (if (= tag :leaky-relu) 0.01 1.0))]
+      (when-not (finite-number? value)
+        (invalid :nn/invalid-spec "Activation parameter must be finite" {:tag tag :options options}))
+      (case tag
+        :leaky-relu (Activation/leakyReluBlock (float value))
+        :elu (Activation/eluBlock (float value))
+        :swish (Activation/swishBlock (float value))))))
+
+;; Native Blocks, factories, lambdas and constant embeddings hold objects or
+;; functions, so they have no serializable-arguments? method.
+(doseq [tag [:block :factory :lambda]]
+  (defmethod compile-tag tag [tag arguments _]
+    (native! tag arguments)))
+
+(doseq [tag [:relu :relu6 :tanh :sigmoid :gelu :selu :mish :softplus :softsign :prelu :identity
+             :flatten :global-max-pool1d :global-max-pool2d :global-max-pool3d
+             :global-avg-pool1d :global-avg-pool2d :global-avg-pool3d :bert-next-sentence]]
+  (defmethod serializable-arguments? tag [_ arguments]
+    (empty? arguments)))
+
+(doseq [tag [:linear :activation :dropout :conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose
+             :max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d
+             :batchnorm :layernorm :ghost-batchnorm :embedding :word-embedding
+             :rnn :lstm :gru :attention :transformer-encoder :bert :bert-pretraining
+             :reshape :transpose :index :softmax :log-softmax :expand-dims :squeeze
+             :leaky-relu :elu :swish]]
+  (defmethod serializable-arguments? tag [_ _]
+    true))
 
 (defn compile-block
   "Compile Hiccup/native Block into a real DJL Block. No model/manager is created.
@@ -588,56 +728,16 @@
   DJL's NDIndex string grammar unchanged and borrows its singleton input.
   :graph takes {:inputs [names] :outputs [names]} and [name [dependencies] block]
   nodes in any order. Names identify single arrays; :concat (optional :axis,
-  default -1) and :add merge two or more arrays only as graph node blocks."
+  default -1) and :add merge two or more arrays only as graph node blocks.
+  Every other tag is a compile-tag method."
   ^Block [spec]
-  (if (instance? Block spec)
-    spec
-    (do
-      (when-not (and (vector? spec) (keyword? (first spec)))
-        (invalid :nn/invalid-spec "A network block must be a Hiccup vector or DJL Block" {:spec spec}))
-      (let [[tag & arguments] spec]
-        (when (and (no-argument-tags tag) (seq arguments))
-          (invalid :nn/invalid-spec "This block accepts no options or children" {:spec spec}))
-        (case tag
-          :sequential (sequential! arguments)
-          :graph (graph! arguments)
-          :linear (linear! arguments spec)
-          :activation (do
-                        (when-not (= 1 (count arguments))
-                          (invalid :nn/invalid-spec "Activation requires one name" {:spec spec}))
-                        (activation (first arguments)))
-          :dropout (dropout! arguments spec)
-          (:parallel :skip) (combination! tag arguments spec)
-          (:relu :relu6 :tanh :sigmoid :gelu :selu :mish :softplus :softsign :prelu :identity)
-          (activation tag)
-          :flatten (Blocks/batchFlattenBlock)
-          (:batchnorm :layernorm) (normalization! tag (if (seq arguments) arguments [{}]))
-          :ghost-batchnorm (normalization! tag arguments)
-          (:conv1d :conv2d :conv3d :conv1d-transpose :conv2d-transpose) (convolution! tag arguments)
-          (:max-pool1d :max-pool2d :max-pool3d :avg-pool1d :avg-pool2d :avg-pool3d) (pooling! tag arguments)
-          :global-max-pool1d (Pool/globalMaxPool1dBlock)
-          :global-max-pool2d (Pool/globalMaxPool2dBlock)
-          :global-max-pool3d (Pool/globalMaxPool3dBlock)
-          :global-avg-pool1d (Pool/globalAvgPool1dBlock)
-          :global-avg-pool2d (Pool/globalAvgPool2dBlock)
-          :global-avg-pool3d (Pool/globalAvgPool3dBlock)
-          (:embedding :word-embedding :constant-embedding) (embedding! tag arguments)
-          (:rnn :lstm :gru) (recurrent! tag arguments)
-          (:attention :transformer-encoder) (attention! tag arguments)
-          (:bert :bert-pretraining) (bert! tag arguments)
-          :bert-next-sentence (BertNextSentenceBlock.)
-          :index (index! arguments)
-          (:reshape :transpose :softmax :log-softmax :expand-dims :squeeze) (transform! tag arguments)
-          (:leaky-relu :elu :swish)
-          (let [key (if (= tag :swish) :beta :alpha)
-                options (one-options arguments #{key} tag)
-                value (get options key (if (= tag :leaky-relu) 0.01 1.0))]
-            (when-not (finite-number? value)
-              (invalid :nn/invalid-spec "Activation parameter must be finite" {:tag tag :options options}))
-            (case tag :leaky-relu (Activation/leakyReluBlock (float value))
-                  :elu (Activation/eluBlock (float value)) :swish (Activation/swishBlock (float value))))
-          (:block :factory :lambda) (native! tag arguments)
-          (invalid :nn/unknown-tag "Unknown neural network block" {:tag tag}))))))
+  (cond
+    (instance? Block spec) spec
+
+    (not (and (vector? spec) (keyword? (first spec))))
+    (invalid :nn/invalid-spec "A network block must be a Hiccup vector or DJL Block" {:spec spec})
+
+    :else (compile-tag (first spec) (next spec) spec)))
 
 (defn- plain-edn? [value]
   (cond
@@ -649,23 +749,11 @@
     :else false))
 
 (defn serializable-spec?
-  "True only for known, reconstructible plain-EDN block trees. Native Blocks,
+  "True only for reconstructible plain-EDN block trees: every tag has a
+  serializable-arguments? method that accepts its arguments. Native Blocks,
   lambda/factory/constant embeddings and function options are never serialized.
   This is a persistence-policy predicate, not block argument/shape validation."
   [spec]
-  (and (vector? spec) (plain-edn? spec)
-       (let [[tag & args] spec]
-         (cond
-           (= tag :sequential) (every? serializable-spec? args)
-           (= tag :graph)
-           (every? (fn [[_ _ block]]
-                     (if (and (vector? block) (#{:concat :add} (first block)))
-                       true
-                       (serializable-spec? block)))
-                   (rest args))
-           (#{:parallel :skip} tag)
-           (and (map? (first args)) (#{:add :concat} (:combine (first args)))
-                (seq (rest args)) (every? serializable-spec? (rest args)))
-           (no-argument-tags tag) (empty? args)
-           (option-tags tag) true
-           :else false))))
+  (and (vector? spec)
+       (plain-edn? spec)
+       (boolean (serializable-arguments? (first spec) (next spec)))))
