@@ -955,10 +955,10 @@
     (let [network (nn/build current-session two-input-regression-spec
                             {:input-shapes [[1 2] [1 1]]})
           source (table/from {:a [0 1 2 3] :b [10 20 30 40] :y [50 70 90 110]})
-          specification (examples/training-inputs current-session network source
-                                                  {:x [[:a :b] [:a]] :y :y :standardize [:x :y]} :mse)
+          inputs (examples/training-inputs network {:x [[:a :b] [:a]] :y :y :standardize [:x :y]} :mse)
+          prepared (examples/table-examples current-session source inputs true)
+          specification (examples/training-statistics inputs prepared)
           statistics (:statistics specification)
-          prepared (examples/table-examples current-session source specification true)
           [left right] (examples/feature-arrays (context/manager current-session) prepared specification)
           normalized (mapv #(/ (- % 1.5) (Math/sqrt 1.25)) (range 4))]
       (is (= [[1.5 25.0] [1.5]] (mapv #(mapv :mean %) (:x statistics))))
@@ -977,7 +977,7 @@
           source (table/query (sequence-table 0.0) [:derive {:extra [:* :x 10]}])
           options {:x [[:x :cycle] [:extra]] :y :y
                    :sequence {:length 3 :partition-by :battery :order-by :cycle}}
-          specification (examples/training-inputs current-session network source options :mse)
+          specification (examples/training-inputs network options :mse)
           prepared (examples/table-examples current-session source specification true)
           arrays (examples/feature-arrays (context/manager current-session) prepared specification)
           windows (vec (for [row-count [6 5] end (range 2 row-count)]

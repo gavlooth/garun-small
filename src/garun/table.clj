@@ -8,6 +8,13 @@
   named session tables. Execution holds their shared resource locks in sorted
   name order until JDBC results are consumed, excluding release and replacement.
 
+  In-memory sources stay plain column vectors in the plan. Execution appends
+  them into a temporary table on the context's connection and drops it when the
+  query finishes, because binding one SQL parameter per cell costs seconds for tens of
+  thousands of rows. Columns holding only longs, doubles, strings or booleans
+  (and nulls) are appended; any other mix is bound as VALUES parameters so
+  DuckDB keeps deciding its type. Pure ->sql always shows the VALUES form.
+
   Scalar DSL values are lifted parameters, including NULL, numbers and
   booleans. Only [:duckdb {:query ...}] accepts trusted SQL. Local HoneySQL
   extensions handle literal identifiers (including '*'), DuckDB named
@@ -16,12 +23,12 @@
   (:require [clojure.string :as str]
             [garun.context :as context]
             [garun.session :as session]
-            [clojure.walk :as walk]
             [honey.sql :as sql])
   (:import [garun.context Context]
            [java.lang AutoCloseable]
            [java.sql Connection PreparedStatement ResultSet ResultSetMetaData]
-           [java.util UUID]))
+           [java.util Arrays UUID]
+           [org.duckdb DuckDBAppender DuckDBConnection]))
 
 (set! *warn-on-reflection* true)
 
@@ -102,8 +109,11 @@
   (when-not (= (count arguments) expected)
     (invalid! [operation] "Wrong expression or clause arity" arguments)))
 
+(defn- scalar? [value]
+  (or (nil? value) (number? value) (string? value) (boolean? value)))
+
 (defn- literal [value]
-  (when-not (or (nil? value) (number? value) (string? value) (boolean? value))
+  (when-not (scalar? value)
     (invalid! [:literal] "Expected a scalar literal" value))
   [:lift value])
 
@@ -269,15 +279,16 @@
       (invalid! [:source] "Rows must be maps" source))
     (let [ordered (sort-by column-name (if column-input? (keys source) (distinct (mapcat keys source))))
           columns (distinct-names! (mapv column-name ordered))
-          rows (if column-input?
-                 (map (fn [index] (map #(nth (get source %) index) ordered))
-                      (range (if (seq source) (count (first (vals source))) 0)))
-                 (map (fn [row] (map #(get row %) ordered)) source))]
+          values (if column-input?
+                   (mapv #(get source %) ordered)
+                   (mapv (fn [column] (mapv #(get % column) source)) ordered))]
       (when (empty? columns)
         (invalid! [:source] "Source requires at least one named column" source))
-      (if (seq rows)
+      (when-let [[value] (some (fn [column] (some #(when-not (scalar? %) [%]) column)) values)]
+        (invalid! [:literal] "Expected a scalar literal" value))
+      (if (seq (first values))
         (plan {:select [:*]
-               :from [[{:values (mapv #(mapv literal %) rows)}
+               :from [[[:garun/rows {:columns columns :values values}]
                        [:__input__ (mapv identifier columns)]]]} columns)
         (plan {:select (mapv #(vector (literal nil) [(identifier %)]) columns)
                :where (literal false)} columns)))))
@@ -589,48 +600,179 @@
       (invalid! [:query :split] "Split must be the final clause" clauses))
     (reduce clause table clauses)))
 
-(defn- resolved-query [query tables]
-  (walk/postwalk
-   (fn [form]
-     (if (and (vector? form) (= :garun/session-table (first form)))
-       (or (get tables (second form))
-           (throw (ex-info "Session table references require a context"
-                           {:error :table/unresolved-session-table :name (second form)})))
-       form))
-   query))
+(defn- source-reference? [form]
+  (and (vector? form) (contains? #{:garun/session-table :garun/rows} (first form))))
 
-(defn- with-resolved-query [context table operation]
-  (let [query (:query (from table))
-        names (->> (tree-seq coll? seq query)
-                   (filter #(and (vector? %) (= :garun/session-table (first %))))
-                   (map second)
-                   distinct
-                   sort)]
-    ;; Hold all source resources through execution; deterministic ordering prevents
-    ;; opposite join orders from acquiring multiple table locks in opposite orders.
-    (letfn [(resolve-tables [names tables]
-              (if-let [resource-name (first names)]
-                (session/shared
-                 context resource-name :table
-                 (fn [materialized]
-                   (resolve-tables
-                    (next names)
-                    (assoc tables resource-name
-                           (keyword (str (:schema materialized) "." (:table materialized)))))))
-                (operation (resolved-query query tables))))]
-      (resolve-tables names {}))))
+(defn- source-references
+  "List the [:garun/session-table name] and [:garun/rows data] forms in query,
+  without walking into the row data."
+  [query]
+  (cond
+    (source-reference? query) [query]
+    (map? query) (into [] (mapcat source-references) (vals query))
+    (sequential? query) (into [] (mapcat source-references) query)
+    :else []))
+
+(defn- with-sources
+  "Rebuild query with every source reference replaced by (replacement reference)."
+  [query replacement]
+  (cond
+    (source-reference? query) (replacement query)
+    (map? query) (update-vals query #(with-sources % replacement))
+    (vector? query) (mapv #(with-sources % replacement) query)
+    (seq? query) (doall (map #(with-sources % replacement) query))
+    :else query))
+
+(defn- values-rows
+  "The VALUES form of in-memory rows: one bound parameter per cell."
+  [data]
+  {:values (apply mapv (fn [& row] (mapv literal row)) (:values data))})
+
+(defn- session-table-name [tables table-name]
+  (or (get tables table-name)
+      (throw (ex-info "Session table references require a context"
+                      {:error :table/unresolved-session-table :name table-name}))))
+
+(defn- with-values-rows
+  "Rebuild query for display: session tables by their SQL names, in-memory rows as VALUES."
+  [query tables]
+  (with-sources query (fn [[tag value]]
+                        (if (= :garun/session-table tag)
+                          (session-table-name tables value)
+                          (values-rows value)))))
+
+(defn- appended-column-type
+  "The DuckDB type of a temporary-table column that reproduces what DuckDB
+  decides for the same values bound as VALUES parameters, or nil when only
+  DuckDB's own rules give the result (other number classes, mixed kinds)."
+  [column]
+  (let [classes (into #{} (comp (remove nil?) (map class)) column)]
+    (cond
+      (empty? classes) :integer
+      (= #{Long} classes) :bigint
+      (or (= #{Double} classes) (= #{Long Double} classes)) :double
+      (= #{String} classes) :varchar
+      (= #{Boolean} classes) :boolean)))
+
+(defn- append-rows!
+  "Append column-major values to a temporary table whose columns have types."
+  [^DuckDBConnection connection table-name types values]
+  (let [width (count values)
+        row-count (count (first values))
+        columns (object-array values)
+        column-types (object-array types)]
+    (with-open [^DuckDBAppender appender (.createAppender connection "temp" "main" (name table-name))]
+      (dotimes [row row-count]
+        (.beginRow appender)
+        (dotimes [column width]
+          (let [value (nth (aget columns column) row)]
+            (if (nil? value)
+              (.appendNull appender)
+              (case (aget column-types column)
+                :bigint (.append appender (long value))
+                :double (.append appender (double value))
+                :varchar (.append appender ^String value)
+                :boolean (.append appender (boolean value))))))
+        (.endRow appender)))))
+
+(declare drop-table! prepare!)
+
+(defn- create-rows-table!
+  "Create an empty temporary table with one column per type; return its name."
+  [connection types]
+  (let [table-name (keyword (str "__garun_rows_" (str/replace (str (UUID/randomUUID)) "-" "")))
+        columns (mapv (fn [index type] [(keyword (str "c" index)) type]) (range) types)]
+    (with-open [^PreparedStatement statement
+                (prepare! connection
+                          (sql/format {:create-table [:temp table-name] :with-columns columns}
+                                      {:quoted true}))]
+      (.execute statement))
+    table-name))
+
+(defn- with-appended-rows
+  "Run (operation appended) with every distinct in-memory source whose columns
+  can be appended loaded into a temporary table on context's connection.
+  appended pairs each source's data with its table name; the tables are dropped
+  when operation returns or throws."
+  [^Context context query operation]
+  (let [connection (context/connection context)
+        sources (reduce (fn [sources [tag data]]
+                          (if (or (= :garun/session-table tag) (some #(identical? data %) sources))
+                            sources
+                            (conj sources data)))
+                        [] (source-references query))]
+    (letfn [(append [pending appended]
+              (let [data (first pending)
+                    types (mapv appended-column-type (:values data))]
+                (cond
+                  (nil? data) (operation appended)
+                  (some nil? types) (append (rest pending) appended)
+                  :else
+                  (let [table-name (create-rows-table! connection types)]
+                    (try
+                      (append-rows! connection table-name types (:values data))
+                      (append (rest pending) (conj appended [data table-name]))
+                      (finally (drop-table! connection table-name)))))))]
+      (append sources []))))
+
+(defn- with-session-tables
+  "Run (operation tables) holding the shared lock of every named session table in
+  query; tables maps each name to its qualified SQL name. Locks are taken in
+  sorted name order so opposite join orders cannot wait on each other."
+  [context query operation]
+  (letfn [(resolve-tables [names tables]
+            (if-let [resource-name (first names)]
+              (session/shared
+               context resource-name :table
+               (fn [materialized]
+                 (resolve-tables
+                  (next names)
+                  (assoc tables resource-name
+                         (keyword (str (:schema materialized) "." (:table materialized)))))))
+              (operation tables)))]
+    (resolve-tables (->> (source-references query)
+                         (filter #(= :garun/session-table (first %)))
+                         (map second)
+                         distinct
+                         sort)
+                    {})))
+
+(defn- with-resolved-query
+  "Run (operation query) with query executable on context's connection: session
+  tables locked and named, in-memory rows appended to temporary tables. The
+  locks and temporary tables last until operation returns."
+  [context table operation]
+  (let [query (:query (from table))]
+    (with-session-tables
+      context query
+      (fn [tables]
+        (with-appended-rows
+          context query
+          (fn [appended]
+            (operation
+             (with-sources query
+               (fn [[tag value]]
+                 (if (= :garun/session-table tag)
+                   (session-table-name tables value)
+                   (or (some (fn [[data table-name]] (when (identical? data value) table-name)) appended)
+                       (values-rows value))))))))))))
 
 (defn ->sql
   "Return [SQL & bound-parameters], in SQL placeholder order.
   The pure arity rejects named session sources with
   :table/unresolved-session-table; the context arity resolves their qualified
-  SQL names. Both accept plans and source descriptions."
+  SQL names. Both accept plans and source descriptions. In-memory sources are
+  shown as VALUES with one parameter per cell; execution appends them to a
+  temporary table instead when their column types allow it."
   ([table]
-   (sql/format (resolved-query (:query (from table)) {}) {:quoted true}))
+   (sql/format (with-values-rows (:query (from table)) {}) {:quoted true}))
   ([^Context context table]
    (context/call context
                  (fn []
-                   (with-resolved-query context table #(sql/format % {:quoted true}))))))
+                   (let [query (:query (from table))]
+                     (with-session-tables
+                       context query
+                       #(sql/format (with-values-rows query %) {:quoted true})))))))
 
 (defn- prepare! ^PreparedStatement [^Connection connection [statement-sql & parameters]]
   (let [statement (.prepareStatement connection ^String statement-sql)]
@@ -821,23 +963,83 @@
   [^Context context table path]
   (context/call context (fn [] (copy! context table path "PARQUET"))))
 
-(defn- matrix-cell! [^ResultSet result [index column]]
+(def ^:private long-column-types #{"TINYINT" "SMALLINT" "INTEGER" "BIGINT"})
+
+(def ^:private double-column-types #{"FLOAT" "DOUBLE"})
+
+(defn- null-matrix-value [column]
+  (ex-info "NULL matrix value" {:error :table/null-value :column column}))
+
+(defn- object-cell
+  "Read a cell whose column type has no primitive getter (decimals, unsigned
+  and huge integers, and every nonnumeric type) through its Java object."
+  ^double [^ResultSet result ^long index column]
   (let [value (.getObject result (int index))]
     (cond
-      (nil? value) (throw (ex-info "NULL matrix value" {:error :table/null-value :column column}))
+      (nil? value) (throw (null-matrix-value column))
       (not (number? value)) (throw (ex-info "Nonnumeric matrix value"
                                             {:error :table/non-numeric :column column :value value}))
-      :else (float value))))
+      :else (double value))))
 
-(defn- matrix-row! [result indexed-columns]
-  (mapv #(matrix-cell! result %) indexed-columns))
+(defn- read-matrix!
+  "Read every remaining row into one growing row-major float array. Signed
+  integer and floating columns use primitive getters, so no cell is boxed.
+  Each column's mean and population standard deviation are accumulated from
+  the values DuckDB returned, before they are narrowed to float32."
+  [^ResultSet result column-selection]
+  (let [metadata (.getMetaData result)
+        width (count column-selection)
+        ;; 1 reads a long, 2 a double, 0 the column's Java object.
+        getters (int-array (map (fn [index]
+                                  (let [type-name (.getColumnTypeName metadata (int (inc index)))]
+                                    (cond (long-column-types type-name) 1
+                                          (double-column-types type-name) 2
+                                          :else 0)))
+                                (range width)))
+        sums (double-array width)
+        means (double-array width)
+        squared-deviations (double-array width)]
+    (loop [^floats data (float-array (* 1024 width))
+           row-count 0]
+      (if (.next result)
+        (let [offset (* row-count width)
+              ^floats data (if (< (alength data) (+ offset width))
+                             (Arrays/copyOf data (int (* 2 (alength data))))
+                             data)
+              seen (double (inc row-count))]
+          (dotimes [index width]
+            (let [getter (aget getters index)
+                  position (inc index)
+                  value (double (case getter
+                                  1 (double (.getLong result (int position)))
+                                  2 (.getDouble result (int position))
+                                  (object-cell result position (nth column-selection index))))
+                  _ (when (and (pos? getter) (.wasNull result))
+                      (throw (null-matrix-value (nth column-selection index))))
+                  delta (- value (aget means index))
+                  mean (+ (aget means index) (/ delta seen))]
+              (aset data (+ offset index) (float value))
+              (aset sums index (+ (aget sums index) value))
+              (aset means index mean)
+              (aset squared-deviations index
+                    (+ (aget squared-deviations index) (* delta (- value mean))))))
+          (recur data (inc row-count)))
+        {:rows row-count
+         :cols width
+         :data (Arrays/copyOf data (int (* row-count width)))
+         :statistics (mapv (fn [index]
+                             {:mean (/ (aget sums index) row-count)
+                              :standard-deviation (Math/sqrt (/ (aget squared-deviations index) row-count))})
+                           (range width))}))))
 
 (defn matrix
-  "Return numeric columns as {:rows n :cols k :data float-array}, row-major.
-  Column order follows column-selection and row order follows the table.
-  The context retains its connection. NULL and nonnumeric cells throw
-  :table/null-value and :table/non-numeric respectively. Invalid selections
-  throw ExceptionInfo; JDBC failures propagate."
+  "Return numeric columns as {:rows n :cols k :data float-array :statistics [...]},
+  row-major. Column order follows column-selection and row order follows the
+  table. :statistics holds each column's {:mean :standard-deviation}
+  (population), computed in double precision during the same read; they are
+  NaN for an empty table. The context retains its connection. NULL and
+  nonnumeric cells throw :table/null-value and :table/non-numeric respectively.
+  Invalid selections throw ExceptionInfo; JDBC failures propagate."
   [^Context context table column-selection]
   (context/call context
                 (fn []
@@ -847,25 +1049,30 @@
                               column-selection))
                   (with-result!
                     context (query table [:select column-selection])
-                    (fn [^ResultSet result]
-                      (let [indexed-columns (mapv vector (range 1 (inc (count column-selection)))
-                                                  column-selection)
-                    ;; Realize each row while its cursor is current; no row maps or Java
-                    ;; helper/build step are needed for this functional JDBC traversal.
-                            values (sequence (comp (take-while (fn [_] (.next result)))
-                                                   (mapcat (fn [_] (matrix-row! result indexed-columns))))
-                                             (range))
-                            data (float-array values)]
-                        {:rows (quot (alength data) (count column-selection))
-                         :cols (count column-selection) :data data}))))))
+                    #(read-matrix! % column-selection)))))
+
+(defn- matrix-columns
+  "Copy the columns at indices, in that order, into a new row-major matrix."
+  [{:keys [rows cols statistics] ^floats data :data} indices]
+  (let [^ints indices (int-array indices)
+        width (alength indices)
+        rows (long rows)
+        cols (long cols)
+        selected (float-array (* rows width))]
+    (dotimes [row rows]
+      (dotimes [column width]
+        (aset selected (+ (* row width) column)
+              (aget data (+ (* row cols) (aget indices column))))))
+    {:rows rows :cols width :data selected :statistics (mapv statistics indices)}))
 
 (defn matrices
   "Extract float32 row-major matrices through context, one per keyword group.
   The unique union is selected in ONE matrix query and then split/reordered
   in memory, preserving feature/label alignment for nondeterministic sources.
-  Returned host matrices are independent of the context's manager lifetime.
-  Table NULL/nonnumeric errors propagate unchanged. Native tensors/datasets
-  are the precision-preserving path for non-float32 data."
+  Each matrix carries its columns' :statistics from that same read. Returned
+  host matrices are independent of the context's manager lifetime. Table
+  NULL/nonnumeric errors propagate unchanged. Native tensors/datasets are the
+  precision-preserving path for non-float32 data."
   [^Context context source column-groups]
   (when-not (and (vector? column-groups) (seq column-groups)
                  (every? #(and (vector? %) (seq %) (every? keyword? %)) column-groups))
@@ -873,14 +1080,9 @@
                     {:error :tensor/invalid-columns :value column-groups})))
   (let [columns (vec (distinct (mapcat identity column-groups)))
         positions (zipmap columns (range))
-        {:keys [rows data] :as matrix} (matrix context source columns)
-        column-count (:cols matrix)]
+        extracted (matrix context source columns)]
     (mapv (fn [group]
             (if (= group columns)
-              matrix
-              (let [indices (mapv positions group)]
-                {:rows rows :cols (count group)
-                 :data (float-array (for [row (range rows)
-                                          column indices]
-                                      (aget ^floats data (int (+ (* row column-count) column)))))})))
+              extracted
+              (matrix-columns extracted (mapv positions group))))
           column-groups)))

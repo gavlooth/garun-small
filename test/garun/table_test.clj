@@ -407,6 +407,95 @@
       (is (= :table/null-value (error-code #(table/matrix current-session (table/from {:x [nil 1]}) [:x]))))
       (is (= :table/non-numeric (error-code #(table/matrix current-session (table/from {:x ["a"]}) [:x])))))))
 
+(defn- near? [expected actual]
+  (<= (Math/abs (- (double expected) (double actual)))
+      (* 1.0e-9 (max 1.0 (Math/abs (double expected))))))
+
+(deftest matrix-reads-each-numeric-type-and-measures-statistics-in-the-same-read
+  (with-open [current-session (session/open)]
+    (let [columns [:tiny :big :narrow :wide :exact :unsigned]
+          source (table/from [:duckdb {:query (str "SELECT (i % 100)::TINYINT AS tiny, (i * 1000003)::BIGINT AS big, "
+                                                   "(i / 4.0)::FLOAT AS narrow, i * 0.5 AS wide, "
+                                                   "(i % 7)::DECIMAL(9,2) AS exact, (i % 5)::UTINYINT AS unsigned "
+                                                   "FROM range(5000) t(i)")}])
+          matrix (table/matrix current-session source columns)
+          aggregates (first (table/rows current-session
+                                        (table/query source
+                                                     [:group-by []
+                                                      (into {} (mapcat (fn [column]
+                                                                         [[(keyword (str "mean_" (name column))) [:avg column]]
+                                                                          [(keyword (str "deviation_" (name column))) [:stddev-pop column]]]))
+                                                            columns)])))
+          row (fn [index] (vec (take 6 (drop (* 6 index) (:data matrix)))))]
+      ;; More rows than the first allocation, so the array has grown several times.
+      (is (= [5000 6 30000] [(:rows matrix) (:cols matrix) (alength ^floats (:data matrix))]))
+      (is (= [0.0 0.0 0.0 0.0 0.0 0.0] (row 0)))
+      (is (= (mapv float [99 (* 4999 1000003) (/ 4999 4.0) (* 4999 0.5) 1 4]) (row 4999)))
+      (doseq [[column statistics] (map vector columns (:statistics matrix))]
+        (is (near? (get aggregates (keyword (str "mean_" (name column)))) (:mean statistics)) (name column))
+        (is (near? (get aggregates (keyword (str "deviation_" (name column)))) (:standard-deviation statistics))
+            (name column))))
+    (let [[features labels] (table/matrices current-session (table/from {:a [1 2 3 4] :b [10 20 30 40]})
+                                            [[:b :a] [:a]])]
+      (is (= [10.0 1.0 20.0 2.0 30.0 3.0 40.0 4.0] (vec (:data features))))
+      (is (= [1.0 2.0 3.0 4.0] (vec (:data labels))))
+      (is (= [25.0 2.5] (mapv :mean (:statistics features))))
+      (is (= (second (:statistics features)) (first (:statistics labels)))))
+    (let [empty-matrix (table/matrix current-session (table/from {:x []}) [:x])]
+      (is (= [0 0] [(:rows empty-matrix) (alength ^floats (:data empty-matrix))]))
+      (is (Double/isNaN (:mean (first (:statistics empty-matrix))))))
+    (doseq [[query expected] [["SELECT NULL::DOUBLE AS x" :table/null-value]
+                              ["SELECT NULL::BIGINT AS x" :table/null-value]
+                              ["SELECT NULL::DECIMAL(9,2) AS x" :table/null-value]
+                              ["SELECT true AS x" :table/non-numeric]
+                              ["SELECT DATE '2026-01-01' AS x" :table/non-numeric]]]
+      (is (= expected (error-code #(table/matrix current-session (table/from [:duckdb {:query query}]) [:x])))
+          query))))
+
+(defn- temporary-row-tables [current-session]
+  (:n (first (table/rows current-session
+                         (table/from [:duckdb {:query (str "SELECT count(*) AS n FROM duckdb_tables() "
+                                                           "WHERE starts_with(table_name, '__garun_rows_')")}])))))
+
+(deftest in-memory-sources-keep-duckdb-types-and-leave-no-temporary-tables
+  (with-open [current-session (session/open)
+              worker (session/worker current-session)]
+    ;; Appended columns and columns bound as VALUES parameters both get the type DuckDB decides.
+    (doseq [[column expected-type expected-values]
+            [[[1 2 nil] :int64 [1 2 nil]]
+             [[1.5 nil 2.5] :float64 [1.5 nil 2.5]]
+             [[1 2.5] :float64 [1.0 2.5]]
+             [["a" nil "'quoted'"] :string ["a" nil "'quoted'"]]
+             [[true false nil] :bool [true false nil]]
+             [[nil nil] :int32 [nil nil]]
+             [[Long/MAX_VALUE Long/MIN_VALUE] :int64 [Long/MAX_VALUE Long/MIN_VALUE]]
+             [[(int 1) (int 2)] :int32 [1 2]]
+             [[(float 1.5) (float 2.5)] :float32 [1.5 2.5]]
+             [[1.5M 2.5M] (keyword "decimal(2,1)") [1.5M 2.5M]]
+             [[true 1] :int64 [1 1]]]]
+      (let [source (table/from {:x column})]
+        (is (= [{:name "x" :type expected-type}] (table/schema current-session source)) (pr-str column))
+        (is (= expected-values (mapv :x (table/rows worker source))) (pr-str column))))
+    (is (thrown? java.sql.SQLException (table/rows current-session (table/from {:x ["a" 1]}))))
+    (let [row-count 3000
+          data {:id (vec (range row-count))
+                :ratio (mapv #(/ % 8.0) (range row-count))
+                :label (mapv #(when (odd? %) (str "label-" %)) (range row-count))}
+          source (table/from data)
+          rows (mapv (fn [index] {:id index :ratio (/ index 8.0) :label (when (odd? index) (str "label-" index))})
+                     (range row-count))]
+      (is (= data (table/columns current-session source)))
+      (is (= rows (table/rows current-session (table/from rows))))
+      ;; The same source used twice in one query is loaded once and read twice.
+      (is (= row-count (table/row-count current-session (table/query source [:join source {:on [:id]}]))))
+      (is (= (* 3 row-count) (dec (count (table/->sql source)))))
+      (is (thrown? java.sql.SQLException
+                   (table/rows current-session (table/query source [:derive {:number [:cast :label :int64]}]))))
+      (table/materialize! current-session :loaded source)
+      (is (= row-count (table/row-count worker :loaded))))
+    (is (zero? (temporary-row-tables current-session)))
+    (is (zero? (temporary-row-tables worker)))))
+
 (deftest invalid-dsl-is-rejected
   (let [source (table/from {:x [1]})]
     (is (= :table/unknown-clause (error-code #(table/query source [:wat 1]))))

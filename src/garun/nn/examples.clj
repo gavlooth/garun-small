@@ -1,11 +1,12 @@
 (ns garun.nn.examples
   "Prepare table examples and align their labels, predictions, and metrics.
 
-  DuckDB computes training-only standardization statistics and orders sequence
-  rows. All feature groups, labels and window flags share one extraction. This
-  namespace owns the persisted grouped input specification, window layouts,
-  and manager-owned arrays/ArrayDatasets. It accepts Model/network data without
-  depending on garun.nn; network lifecycles and training remain in that namespace."
+  DuckDB orders sequence rows. All feature groups, labels and window flags share
+  one extraction, and training-only standardization statistics are measured in
+  that same read. This namespace owns the persisted grouped input specification,
+  window layouts, and manager-owned arrays/ArrayDatasets. It accepts
+  Model/network data without depending on garun.nn; network lifecycles and
+  training remain in that namespace."
   (:require [clojure.edn :as edn]
             [garun.metrics :as metrics]
             [garun.table :as table]
@@ -111,53 +112,44 @@
                {:standardize requested}))
     (assoc specification :statistics statistics)))
 
-(defn- training-statistics [context source specification]
-  (let [groups (into {}
-                     (map (fn [group]
-                            [group (if (= group :x)
-                                     (vec (mapcat identity (:x specification)))
-                                     (column-vector (:y specification) :nn/invalid-labels))]))
-                     (:standardize specification))
-        columns (vec (distinct (mapcat identity (vals groups))))
-        aliases (mapv (fn [index column]
-                        {:column column :mean (keyword (str "mean_" index))
-                         :standard-deviation (keyword (str "standard_deviation_" index))})
-                      (range) columns)]
-    (when (seq columns)
-      (let [aggregates (into {} (mapcat (fn [{:keys [column mean standard-deviation]}]
-                                          [[mean [:avg column]] [standard-deviation [:stddev-pop column]]]))
-                             aliases)
-            statistics (first (table/rows context (table/query source [:group-by [] aggregates])))
-            per-column (into {} (map (fn [{:keys [column mean standard-deviation]}]
-                                       (let [average (get statistics mean)
-                                             deviation (get statistics standard-deviation)]
-                                         (when-not (and (number? average) (number? deviation)
-                                                        (Double/isFinite (double average))
-                                                        (Double/isFinite (double deviation)))
-                                           (invalid :nn/invalid-statistics
-                                                    "Standardization requires nonempty finite numeric training columns"
-                                                    {:column column :statistics statistics}))
-                                         [column {:mean (double average)
-                                                  :standard-deviation (max 1.0e-9 (double deviation))}])))
-                             aliases)]
-        (into {}
-              (map (fn [[group group-columns]]
-                     [group (if (= group :x)
-                              (mapv #(mapv per-column %) (:x specification))
-                              (mapv per-column group-columns))]))
-              groups)))))
-
 (defn training-inputs
-  "Resolve table training inputs and compute fresh statistics from training alone.
-  Classification targets cannot be standardized; serializable loss specs persist."
-  [context network source options loss]
+  "Resolve table training inputs against the network; training-statistics adds
+  the statistics once the training rows are extracted. Classification targets
+  cannot be standardized; serializable loss specs persist."
+  [network options loss]
   (let [specification (input-specification network options)
         loss-tag (if (vector? loss) (first loss) loss)]
     (column-vector (:y specification) :nn/invalid-labels)
     (when (and (#{:ce :bce} loss-tag) (some #{:y} (:standardize specification)))
       (invalid :nn/invalid-standardization "Classification targets cannot be standardized" {}))
-    (cond-> (assoc specification :statistics (training-statistics context source specification))
+    (cond-> specification
       (or (keyword? loss) (vector? loss)) (assoc :loss loss))))
+
+(defn- usable-statistics [columns measured]
+  (mapv (fn [column {:keys [mean standard-deviation] :as statistics}]
+          (when-not (and (Double/isFinite (double mean)) (Double/isFinite (double standard-deviation)))
+            (invalid :nn/invalid-statistics
+                     "Standardization requires nonempty finite numeric training columns"
+                     {:column column :statistics statistics}))
+          {:mean mean :standard-deviation (max 1.0e-9 (double standard-deviation))})
+        columns measured))
+
+(defn training-statistics
+  "Add to specification the mean and population standard deviation of every
+  column in the groups it standardizes, as measured while examples were
+  extracted from the training source: over every training row, before sequence
+  windows repeat rows. A column used by several groups gets the same values."
+  [specification examples]
+  (let [measured (:statistics examples)]
+    (assoc specification :statistics
+           (when (seq (:standardize specification))
+             (into {}
+                   (map (fn [group]
+                          [group (if (= :x group)
+                                   (mapv usable-statistics (:x specification) (:x measured))
+                                   (usable-statistics (column-vector (:y specification) :nn/invalid-labels)
+                                                      (:y measured)))]))
+                   (:standardize specification))))))
 
 (defn- matrix-row [matrix row]
   (let [^floats values (:data matrix)
@@ -165,11 +157,26 @@
         offset (* row width)]
     (map #(aget values (int (+ offset %))) (range width))))
 
+(defn- window-rows
+  "Copy, for each window, the length consecutive rows that end at its end row
+  into one row-major array. A window is one contiguous block of the matrix."
+  ^floats [matrix ^ints end-rows ^long length]
+  (let [^floats data (:data matrix)
+        width (long (:cols matrix))
+        span (* length width)
+        windows (float-array (* (alength end-rows) span))]
+    (dotimes [window (alength end-rows)]
+      (System/arraycopy data (int (* (- (inc (aget end-rows window)) length) width))
+                        windows (int (* window span)) (int span)))
+    windows))
+
 (defn table-examples
   "Extract features and optional labels, one example per row or full sequence window.
   SQL marks each full window's end with an exact float32 0/1 flag; windows stay
   within partitions and labels come from the window's last row. One query extracts
-  features, labels and flags together without coercing partition identities."
+  features, labels and flags together without coercing partition identities.
+  :statistics holds every extracted column's mean and population standard
+  deviation, per feature group under :x and for the labels under :y."
   [context source specification labels?]
   (let [input-groups (:x specification)
         label-columns (when labels? (column-vector (:y specification) :nn/invalid-labels))
@@ -192,28 +199,25 @@
         matrices (table/matrices context source groups)
         features (subvec matrices 0 (count input-groups))
         labels (when labels? (nth matrices (count input-groups)))
-        window-ends (when sequence (last matrices))
-        windows (when sequence
-                  (into []
-                        (comp
-                         (filter #(== 1.0 (aget ^floats (:data window-ends) (int %))))
-                         (map #(range (inc (- % length)) (inc %))))
-                        (range (:rows (first features)))))
-        row-count (if sequence (count windows) (:rows (first features)))]
+        ^ints window-end-rows (when sequence
+                                (let [^floats flags (:data (last matrices))]
+                                  (int-array (filter #(== 1.0 (aget flags (int %)))
+                                                     (range (alength flags))))))
+        row-count (if sequence (alength window-end-rows) (:rows (first features)))]
     {:rows row-count
      :features (mapv (fn [matrix]
                        (if sequence
                          {:rows row-count :cols (:cols matrix)
                           :shape [row-count length (:cols matrix)]
-                          :data (float-array
-                                 (mapcat (fn [window] (mapcat #(matrix-row matrix %) window)) windows))}
+                          :data (window-rows matrix window-end-rows length)}
                          (assoc matrix :shape [row-count (:cols matrix)])))
                      features)
      :labels (when labels?
                (if sequence
                  {:rows row-count :cols (count label-columns)
-                  :data (float-array (mapcat #(matrix-row labels (last %)) windows))}
-                 labels))}))
+                  :data (window-rows labels window-end-rows 1)}
+                 labels))
+     :statistics {:x (mapv :statistics features) :y (:statistics labels)}}))
 
 (defn label-layout!
   "Check nonempty table examples against the network output shape and loss labels."

@@ -272,9 +272,9 @@
              ^TrainingConfig configuration (native-training-config network options)
              loss (get options :loss :mse)
              loss-tag (if (vector? loss) (first loss) loss)
-             specification (when-not native?
-                             (examples/training-inputs context network source options loss))
-             examples (when-not native? (examples/table-examples context source specification true))
+             inputs (when-not native? (examples/training-inputs network options loss))
+             examples (when-not native? (examples/table-examples context source inputs true))
+             specification (when-not native? (examples/training-statistics inputs examples))
              validation-examples (when (and (not native?) (:validation options))
                                    (examples/table-examples context (:validation options) specification true))
              _ (when examples (examples/label-layout! network examples loss-tag))
