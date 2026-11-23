@@ -12,7 +12,7 @@ import java.util.Arrays;
 
 /**
  * Transposed convolution using differentiable tensor views/padding and native convolution.
- * DJL 0.36's PyTorch JNI has convolution, but no transposed-convolution entry point.
+ * DJL's PyTorch JNI (0.36 through 0.40) has convolution, but no transposed-convolution entry point.
  * Parameters retain DJL's [outputChannels, inputChannels/groups, spatial...] layout.
  * Each input value contributes weight[k] at inputIndex*stride - padding + k*dilation.
  */

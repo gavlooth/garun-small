@@ -4,13 +4,13 @@ import ai.djl.nn.Parameter;
 import java.util.LinkedHashMap;
 
 /**
- * DJL 0.36 inserts recurrent parameters in type/direction order, but PyTorch
+ * DJL (0.36 through 0.40) inserts recurrent parameters in type/direction order, but PyTorch
  * consumes direction/type order. With biases, bidirectional RNN/GRU/LSTM pass
  * reverse weights where forward biases belong. Reorder the existing parameters
  * once; native forwarding, gradients and parameter serialization stay unchanged.
  *
  * This bridge lives in DJL's package because all three native constructors are
- * package-private. It is deliberately pinned to DJL 0.36's parameter names and
+ * package-private. It is deliberately pinned to DJL's parameter names and
  * constructor contracts, not a replacement recurrent implementation.
  */
 public final class OrderedRecurrent {
