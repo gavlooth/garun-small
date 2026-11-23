@@ -93,7 +93,9 @@ Costs and limits:
 
 ## Status and limits
 
-CPU execution is verified by the test suite and example gallery. CPU is the default device. The opt-in CUDA profile is unverified.
+CPU execution is verified by the test suite and example gallery on Linux x86-64 and, with the x86-64 native jar excluded, on Linux aarch64. CPU is the default device.
+
+GPU execution was checked once on an aarch64 NVIDIA machine with DJL 0.38.0 and a locally built PyTorch 2.11 `cu130`, because no aarch64 CUDA build exists for the pinned versions: training, evaluation and prediction ran on `[:gpu 0]` for dense, bidirectional GRU and transposed-convolution networks, and networks saved on CPU gave the same outputs when loaded on the GPU (largest difference 8e-5, for a bidirectional LSTM). The `:cuda` alias itself, PyTorch 2.7.1 `cu128` on x86-64, is unverified.
 
 Dependencies are pinned to DJL 0.40.0 and PyTorch 2.7.1. Java bridge classes in this repository provide workarounds for limitations in this pinned stack. `garun.bridges-test` checks that stock DJL still has each limitation; a test that fails after a DJL upgrade means the matching bridge can be deleted.
 
