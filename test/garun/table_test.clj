@@ -754,3 +754,88 @@
                          #(table/materialize! current-session :values source)
                          #(table/->sql current-session :values)]]
         (is (= :session/closed (error-code operation)))))))
+
+(deftest call-expressions-run-any-duckdb-function-with-bound-arguments
+  (with-open [current-session (session/open)]
+    (let [source (table/from {:s ["ab" "c"] :a [5 20] :x [3 1] :raw [1 5]})
+          derived (fn [expression-form]
+                    (mapv :y (table/rows current-session
+                                         (table/query source [[:derive {:y expression-form}]
+                                                              [:order-by :x]]))))]
+      (testing "Keyword and string names call functions on column arguments"
+        (is (= ["C" "AB"] (derived [:call :upper :s])))
+        (is (= [1 2] (derived [:call "length" :s]))))
+      (testing "Scalar arguments are bound parameters"
+        (is (= [20 10] (derived [:call :greatest :a 10])))
+        (let [statement-sql (first (table/->sql (table/query source [:derive {:y [:call :greatest :a 10]}])))]
+          (is (string/includes? statement-sql "greatest("))
+          (is (not (string/includes? statement-sql "10")))))
+      (testing "A call may have no arguments"
+        (is (= [Math/PI Math/PI] (derived [:call :pi]))))
+      (testing "A column named raw is an ordinary argument"
+        (is (= [5 1] (derived [:call :greatest :raw 0]))))
+      (testing "A call may be the function of a window"
+        (is (= [1 4] (mapv long (derived [:over [:call :sum :x] {:order-by [:x]}])))))
+      (testing "A call works in filters and aggregates"
+        (is (= [{:s "ab"}]
+               (table/rows current-session
+                           (table/query source [[:where [:> [:call :length :s] 1]] [:select :s]]))))
+        (is (= [{:n 20}]
+               (table/rows current-session
+                           (table/query source [:group-by [] {:n [:call :max :a]}]))))))))
+
+(deftest call-names-never-reach-honeysql-as-function-keywords
+  (let [source (table/from {:x [1]})
+        injected (table/query source [:derive {:y [:call :raw "1; DROP"]}])
+        [statement-sql & parameters] (table/->sql injected)]
+    (testing "A name HoneySQL treats specially is written as a plain function call"
+      (is (string/includes? statement-sql "raw("))
+      (is (not (string/includes? statement-sql "DROP")))
+      (is (some #{"1; DROP"} parameters)))
+    (testing "Names outside [A-Za-z_][A-Za-z0-9_]* are rejected"
+      (doseq [bad-name ["a b" "x;y" "" 1 nil :a/b "1abc" "f(x)" "a\n"]]
+        (is (= :table/invalid
+               (error-code #(table/query source [:derive {:y [:call bad-name :x]}])))
+            (pr-str bad-name)))
+      (is (= :table/invalid (error-code #(table/query source [:derive {:y [:call]}])))))))
+
+(deftest honeysql-expressions-keep-known-column-names
+  (with-open [current-session (session/open)]
+    (let [source (table/from {:x [1 2 3]})
+          tiered (table/query source [:derive {:size [:honeysql [:case [:> :x 1] "big" :else "small"]]}])
+          weights (table/from {:size ["big" "small"] :weight [10 1]})]
+      (is (= [{:x 1 :size "small"} {:x 2 :size "big"} {:x 3 :size "big"}]
+             (table/rows current-session (table/query tiered [:order-by :x]))))
+      (testing "Later clauses can select and join on the derived column"
+        (is (= [{:size "small"} {:size "big"} {:size "big"}]
+               (table/rows current-session (table/query tiered [[:select :size] [:order-by [[:size :desc]]]]))))
+        (is (= [{:x 1 :weight 1} {:x 2 :weight 10} {:x 3 :weight 10}]
+               (table/rows current-session
+                           (table/query tiered [[:join weights {:on [:size]}]
+                                                [:select :x :weight]
+                                                [:order-by :x]])))))
+      (testing "The argument is one HoneySQL expression"
+        (is (= :table/invalid (error-code #(table/query source [:derive {:y [:honeysql]}]))))
+        (is (= :table/invalid (error-code #(table/query source [:derive {:y [:honeysql :x :x]}]))))))))
+
+(deftest describe-summarizes-each-column-in-order
+  (with-open [current-session (session/open)]
+    (let [source (table/from {:x [1 2 3 nil] :s ["a" "b" "b" "c"]})
+          ;; In-memory sources order their columns by name.
+          [s-summary x-summary :as summary] (table/describe current-session source)]
+      (is (= ["s" "x"] (mapv :name summary)))
+      (is (= (mapv :type (table/schema current-session source)) (mapv :type summary)))
+      (is (= [4 4] (mapv :count summary)))
+      (is (= #{:name :type :min :max :approx-unique :avg :std :q25 :q50 :q75 :count :null-percentage}
+             (set (keys x-summary))))
+      (is (= ["1" "3"] [(str (:min x-summary)) (str (:max x-summary))]))
+      (is (= ["a" "c"] [(:min s-summary) (:max s-summary)]))
+      (is (== 25 (:null-percentage x-summary)))
+      (testing "Plan parameters stay bound"
+        (let [[filtered-x] (table/describe current-session
+                                           (table/query source [[:where [:> :x 1]] [:select :x]]))]
+          (is (= ["2" "3"] [(str (:min filtered-x)) (str (:max filtered-x))])))))
+    (testing "A named materialized table can be summarized"
+      (let [materialized (table/materialize! current-session :described {:x [1 2 3 nil] :s ["a" "b" "b" "c"]})]
+        (is (= ["s" "x"] (mapv :name (table/describe current-session materialized))))
+        (is (= ["s" "x"] (mapv :name (table/describe current-session :described))))))))

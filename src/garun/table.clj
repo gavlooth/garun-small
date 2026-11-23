@@ -90,6 +90,15 @@
 
 (sql/register-fn! :garun/struct-field named-argument)
 
+;; The function name is written into the SQL text unquoted, so it is validated
+;; by call-name! and never passed to HoneySQL as a function keyword, which
+;; would give names such as raw or case special meaning.
+(sql/register-fn! :garun/call
+                  (fn [_ [function-name & arguments]]
+                    (let [formatted (map sql/format-expr arguments)]
+                      (into [(str function-name "(" (str/join ", " (map first formatted)) ")")]
+                            (mapcat rest formatted)))))
+
 ;; DuckDB COPY does not accept bound paths. Only this extension escapes a
 ;; validated output path; the query itself is bound through CREATE TABLE AS.
 (sql/register-clause!
@@ -187,6 +196,14 @@
     (second value)
     value))
 
+(defn- call-name! [function-name]
+  (let [text (cond
+               (and (keyword? function-name) (nil? (namespace function-name))) (name function-name)
+               (string? function-name) function-name)]
+    (when-not (and text (re-matches #"[A-Za-z_][A-Za-z0-9_]*" text))
+      (invalid! [:call] "Function name must match [A-Za-z_][A-Za-z0-9_]*" function-name))
+    text))
+
 (defn- function-arguments! [operation arguments arity]
   (let [argument-count (count arguments)
         valid? (cond (vector? arity) (<= (first arity) argument-count (second arity))
@@ -212,7 +229,7 @@
     (let [[operation & arguments] input-expression
           arity (cond
                   (or (contains? binary-operators operation) (#{:in :cast :over} operation)) 2
-                  (or (contains? unary-operators operation) (#{:col :lit} operation)) 1
+                  (or (contains? unary-operators operation) (#{:col :lit :honeysql} operation)) 1
                   (= :between operation) 3)]
       (when arity (arity! operation arguments arity))
       (cond
@@ -252,6 +269,8 @@
             (when (> (count arguments) 1)
               (invalid! [operation] "COUNT takes zero or one argument" arguments))
             [:count (if (seq arguments) (expression (first arguments)) :*)])
+          :honeysql (first arguments)
+          :call (into [:garun/call (call-name! (first arguments))] (map expression (rest arguments)))
           :over [:over [(expression (first arguments)) (window-spec (second arguments))]]
           (throw (ex-info "Unknown expression operator"
                           {:error :table/unknown-operator :operator operation})))))))
@@ -837,10 +856,12 @@
   {"BIGINT" :int64 "INTEGER" :int32 "DOUBLE" :float64 "FLOAT" :float32
    "VARCHAR" :string "BOOLEAN" :bool "DATE" :date "TIMESTAMP" :timestamp})
 
+(defn- column-type [type-name]
+  (get column-types type-name (keyword (str/lower-case type-name))))
+
 (defn- column-descriptor [^ResultSetMetaData metadata index]
-  (let [type-name (.getColumnTypeName metadata (int index))]
-    {:name (.getColumnLabel metadata (int index))
-     :type (get column-types type-name (keyword (str/lower-case type-name)))}))
+  {:name (.getColumnLabel metadata (int index))
+   :type (column-type (.getColumnTypeName metadata (int index)))})
 
 (defn schema
   "Return ordered {:name string :type keyword} DuckDB column descriptors.
@@ -854,6 +875,39 @@
                       (let [metadata (.getMetaData result)]
                         (mapv #(column-descriptor metadata %)
                               (range 1 (inc (.getColumnCount metadata))))))))))
+
+(defn- summary-column [row]
+  {:name (:column_name row)
+   :type (column-type (:column_type row))
+   :min (:min row)
+   :max (:max row)
+   :approx-unique (:approx_unique row)
+   :avg (:avg row)
+   :std (:std row)
+   :q25 (:q25 row)
+   :q50 (:q50 row)
+   :q75 (:q75 row)
+   :count (:count row)
+   :null-percentage (:null_percentage row)})
+
+(defn describe
+  "Run DuckDB SUMMARIZE over a table through the context and return a vector
+  with one map per column, in column order. Keys: :name (string), :type
+  (keyword, as in schema), :min, :max, :approx-unique, :avg, :std, :q25, :q50,
+  :q75, :count and :null-percentage, with the values DuckDB returns. Query
+  parameters stay bound. The context retains its connection; JDBC execution
+  failures propagate."
+  [^Context context table]
+  (context/call context
+                (fn []
+                  (with-resolved-query
+                    context table
+                    (fn [query]
+                      (let [[statement-sql & parameters] (sql/format query {:quoted true})]
+                        (with-open [statement (prepare! (context/connection context)
+                                                        (into [(str "SUMMARIZE " statement-sql)] parameters))
+                                    result (.executeQuery statement)]
+                          (mapv summary-column (result-rows! result Long/MAX_VALUE)))))))))
 
 (defn row-count
   "Execute COUNT(*) through the context and return a long.

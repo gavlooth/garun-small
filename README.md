@@ -263,7 +263,7 @@ Network specifications are data structures. `nn/build` compiles a specification 
 |---|---|
 | `garun.context` | Borrowed native access: `connection`, `manager`, `owner`; lifecycle admission: `call` |
 | `garun.session` | `open`, `worker`, `defaults`, `register!`, `resource`, `value`, `shared`, `exclusive`, `release!`, `describe` |
-| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `row-count`, `matrix`, `matrices`, `materialize!`, `write-csv!`, `write-parquet!` |
+| `garun.table` | Pure plans: `from`, `query`, `->sql`, `table?`. Through a context: `rows`, `columns`, `schema`, `describe`, `row-count`, `matrix`, `matrices`, `materialize!`, `write-csv!`, `write-parquet!` |
 | `garun.blocks` | `compile-block`, `serializable-spec?`; Hiccup or native DJL `Block` |
 | `garun.tensor` | `device`, `dtype`, `shape`, `array`, `ndlist` |
 | `garun.ndarray` (`nd`) | Reflection-free NDArray math, indexing, reductions, shape transforms and NDList access |
