@@ -319,6 +319,8 @@ Supported query clauses: `:select`, `:rename`, `:where`, `:derive`, `:group-by`,
 
 Expressions use Garun operators, aggregates, and window functions (`[:over expr {...}]`).
 
+`[:call name arg ...]` calls any DuckDB function: `[:derive {:shout [:call :upper :name]}]`. The name is a keyword or string matching `[A-Za-z_][A-Za-z0-9_]*`; other names throw `:table/invalid`. Arguments follow the usual rules, so keywords are column names and scalars are bound parameters. `[:call :raw "x"]` calls a function named `raw`; it does not run SQL. `[:honeysql expr]` embeds one HoneySQL expression, for example `[:derive {:tier [:honeysql [:case [:> :gross 100] "high" :else "low"]]}]`. It follows HoneySQL conventions, including `:raw`, is trusted input, and keeps the clause's known column names, which the whole-clause `[:honeysql {...}]` below does not. `(table/describe context table)` runs DuckDB `SUMMARIZE` and returns one map per column with `:name`, `:type`, `:min`, `:max`, `:approx-unique`, `:avg`, `:std`, `:q25`, `:q50`, `:q75`, `:count` and `:null-percentage`.
+
 Use `[:honeysql clause-map]` for HoneySQL SELECT queries. Garun supplies `FROM` from the preceding table and defaults to `SELECT *` when no projection is supplied. Supported clauses include projections (including DISTINCT), WHERE, grouping/HAVING, windows/QUALIFY, ordering, limits/offsets, joins, and CTEs. Source replacement and DDL/DML clauses are rejected.
 
 ```clojure
