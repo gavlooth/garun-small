@@ -323,11 +323,10 @@
   [chunks]
   (let [rows (long (reduce + 0 (map :rows chunks)))
         cols (long (:cols (first chunks) 0))
-        joined (double-array (* rows cols))]
-    (reduce (fn [offset {^doubles data :data}]
-              (System/arraycopy data 0 joined (int offset) (alength data))
-              (+ (long offset) (alength data)))
-            0 chunks)
+        joined (double-array (* rows cols))
+        offsets (reductions + 0 (map #(* (long (:rows %)) cols) chunks))]
+    (doseq [[offset {^doubles data :data}] (map vector offsets chunks)]
+      (System/arraycopy data 0 joined (int offset) (alength data)))
     {:rows rows :cols cols :data joined}))
 
 (defn restore-targets
