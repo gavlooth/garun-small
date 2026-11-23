@@ -74,13 +74,15 @@ Classical estimators (such as k-means, SVM, or XGBoost), Rust bindings, and visu
 
 `table/from` and `table/query` return a description of a query as a Clojure map. Building a plan does not open a database connection or read a file. You can inspect plans at the REPL and print the generated SQL and parameters with `(table/->sql plan)`. DuckDB runs the query when you pass the plan to an execution function such as `table/rows`, `table/materialize!`, or `nn/train!`.
 
+In-memory sources (`(table/from {:x [1 2]})` or a vector of row maps) stay plain column vectors inside the plan. Each execution appends them to a temporary DuckDB table on the context's connection and drops that table when the query finishes. Columns holding only longs, doubles, strings or booleans (with nulls) are appended; a column with any other mix is bound as `VALUES` parameters so that DuckDB decides its type. `table/->sql` always shows the `VALUES` form.
+
 Using table plans and DuckDB provides:
 - Direct file reads for CSV, Parquet, and JSON files.
 - Out-of-core SQL execution for data larger than RAM, subject to DuckDB memory and disk limits.
 - In-engine joins, window functions, and grouped aggregations.
 - Deterministic keyed data splits: rows with the same key (such as an entity or customer ID) stay in one partition. Fractions define hash-bucket proportions for row assignment.
 - Materialized session tables in DuckDB, accessible across worker threads with per-worker connections and tensor sub-managers.
-- In-engine standardization: DuckDB computes mean and population standard deviation across training rows in one query; garun reuses these values for validation and inference.
+- Standardization without a second query: the read that extracts the training rows also measures each column's mean and population standard deviation in double precision; garun reuses these values for validation and inference.
 
 Costs and limits:
 - Float32 matrix extraction: For model training, selected feature and label columns cross into JVM host memory once as float32 matrices before conversion into DJL tensors.
@@ -93,14 +95,14 @@ Costs and limits:
 
 CPU execution is verified by the test suite and example gallery. CPU is the default device. The opt-in CUDA profile is unverified.
 
-Dependencies are pinned to DJL 0.36.0 and PyTorch 2.7.1. Java bridge classes in this repository provide workarounds for limitations in this pinned stack:
+Dependencies are pinned to DJL 0.40.0 and PyTorch 2.7.1. Java bridge classes in this repository provide workarounds for limitations in this pinned stack. `garun.bridges-test` checks that stock DJL still has each limitation; a test that fails after a DJL upgrade means the matching bridge can be deleted.
 
 | Bridge | Reason |
 |---|---|
 | [`FnBlock`](java/garun/djl/FnBlock.java) | Exposes protected child initialization/forwarding hooks for Clojure parallel and residual combinations. |
 | [`TransposeConvolution`](java/garun/djl/TransposeConvolution.java) | Implements differentiable transposed convolution because PyTorch JNI has no transposed-convolution entry point. |
 | [`MaskedTransformerEncoder`](java/garun/djl/MaskedTransformerEncoder.java) | Initializes encoder children from the embedding shape, not the optional attention-mask shape. |
-| [`TensorOptimizer`](java/garun/djl/TensorOptimizer.java) | Supplies device-native optimizer updates where the pinned PyTorch optimizer kernels are incomplete. |
+| [`TensorOptimizer`](java/garun/djl/TensorOptimizer.java) | Supplies device-native optimizer updates. DJL's PyTorch engine has no NAG, RMSProp, Adagrad or Adadelta kernel, and its Adam and SGD kernels give different weights when `:clip-grad` is set. |
 | [`OrderedRecurrent`](java/ai/djl/nn/recurrent/OrderedRecurrent.java) | Fixes biased bidirectional RNN/GRU/LSTM parameter ordering to match PyTorch's native contract. |
 
 ## Requirements and quick start
@@ -288,6 +290,10 @@ Functions managing stateful resources take a context as their first argument (a 
 
 Closing a session closes open workers, closes owned resources in reverse registration order, drops the session's private DuckDB schema, closes the tensor manager, and closes the DuckDB connection. Resources registered with `{:owned? false}` remain open. `session/release!` closes an individual resource before session close. Registering an existing name throws an exception unless `{:replace? true}` is passed.
 
+`(session/register! context value {:kind :trainer :after network})` registers a value that needs another registered value, as a trainer needs its network. Operations on it lock that other value first, in the same mode, and releasing or replacing the other value releases it first. `nn/trainer` registers every trainer after its network.
+
+An owned value the session has released throws `:session/released` when passed to a session operation again. Objects the session never registered are used as given, without a lock; their caller synchronizes them.
+
 Printing a session, network, or trainer at the REPL shows its record fields. `clojure.datafy/datafy` converts sessions into Clojure maps.
 
 ```clojure
@@ -300,7 +306,7 @@ Printing a session, network, or trainer at the REPL shows its record fields. `cl
 
 Networks print as `#garun/network {...}`, trainers as `#garun/trainer {...}`.
 
-Contexts are thread-confined: use one thread per context. `(session/worker context)` returns a worker with its own DuckDB connection and child tensor manager. Workers share access to the parent session's registry and materialized tables. Predictions on a network can run concurrently across threads. Training acquires an exclusive lock on the network. Queries acquire read locks on named tables, so release or replacement waits for active queries to complete.
+Contexts are thread-confined: use one thread per context. `(session/worker context)` returns a worker with its own DuckDB connection and child tensor manager. Workers share access to the parent session's registry and materialized tables. Predictions on a network can run concurrently across threads. Training acquires an exclusive lock on the network. Queries acquire read locks on named tables, so release or replacement waits for active queries to complete. An operation that looked a name up and then waited for a replacement of that name continues with the new value. Asking for exclusive access inside a shared operation on the same value throws `:session/exclusive-inside-shared`, because waiting for it would never end.
 
 Table sources include a column map, a vector of row maps, `[:csv {:path :header? :delimiter}]`, `[:parquet {:path}]`, `[:json {:path}]`, `[:duckdb {:query "SELECT …"}]`, or the keyword name of a materialized session table. DuckDB query strings execute as trusted SQL.
 
@@ -349,10 +355,11 @@ The per-tag builders in `src/garun/blocks.clj` define the full option contracts.
 - `[:index "<DJL NDIndex string>"]` indexes one input tensor using DJL's index grammar: slices, steps, negative indices, `...`, and `:`. The argument must be a nonempty string without NUL characters. Output shapes are inferred automatically. `[:index ":, -1"]` selects the last time step, mapping `[N,T,H]` to `[N,H]`; `[:index ":, ::2, :"]` strides over time, and `[:index "..., 0"]` drops the last axis by selecting its first entry. These specs serialize directly as EDN.
 - `:parallel` passes the same input to every child block. `:skip` adds or concatenates the block output with the original input. Both accept `{:combine :add}` or `{:combine :concat :axis -1}`, or a custom combining function with an optional `:shape-fn`. Multi-output addition requires matching output counts.
 - A native `Block` works directly or wrapped as `[:block block]`. `[:factory make-block]` calls a zero-argument constructor function. `[:lambda f]` accepts a Clojure function from `NDList` to `NDList`; `[:lambda {:singleton? true} f]` accepts a function from `NDArray` to `NDArray`.
+- Every tag is a method of `garun.blocks/compile-tag`. A tag of your own is `(defmethod blocks/compile-tag ::my-block [_ arguments spec] …)` returning a DJL `Block`; add `(defmethod blocks/serializable-arguments? ::my-block [_ arguments] true)` when its spec is plain EDN, and a saved network using it loads without `:spec` once your namespace is loaded. Use a namespaced tag.
 
 `garun.djl.FnBlock` supplies DJL's protected child initialization and forwarding methods. Java bridge classes also implement differentiable transposed convolution, masked transformer initialization, and tensor-native optimizers where the pinned PyTorch backend lacks the public operation. Transposed convolution uses DJL's weight layout `[filters, input-channels/groups, kernel…]`.
 
-DJL 0.36 orders biased bidirectional RNN/GRU/LSTM parameters differently from PyTorch's native contract. The `ai.djl.nn.recurrent.OrderedRecurrent` bridge reorders parameter objects during block construction to match PyTorch parameter layout, preserving native gradients and serialization compatibility.
+DJL (0.36 through 0.40) orders biased bidirectional RNN/GRU/LSTM parameters differently from PyTorch's native contract. The `ai.djl.nn.recurrent.OrderedRecurrent` bridge reorders parameter objects during block construction to match PyTorch parameter layout, preserving native gradients and serialization compatibility.
 
 `nn/build` accepts either `:input-shape` (one sample shape; batch dimension 1 is prepended automatically) or `:input-shapes` (concrete DJL shapes for multi-input architectures). These options are mutually exclusive. `:dtype` defaults to `:float32`, `:device` defaults to `:cpu`, and `:engine` selects a DJL engine.
 
@@ -405,11 +412,11 @@ Graphs composed of serializable EDN blocks are serializable specifications; `nn/
 | `:x` | One keyword vector for a single input, a vector of keyword vectors in network input order, or a map from graph input names to keyword vectors |
 | `:y` | Label column keyword or vector of label column keywords |
 | `:sequence` | Full windows of `:length` rows per `:partition-by`, ordered by `:order-by`; the label is the last row's `:y`. Input is `[windows length features]` |
-| `:standardize` | `[:x]`, `[:y]` or both. Mean and population standard deviation come from the training source only, in one DuckDB aggregate |
+| `:standardize` | `[:x]`, `[:y]` or both. Mean and population standard deviation come from the training source only, measured while its rows are extracted |
 | `:validation` | Another table source, or a DJL `Dataset` for native sources |
 | `:loss`, `:optim`, `:epochs`, `:batch`, `:shuffle?`, `:seed` | As in `garun.training`; `:loss` may also be `(fn [labels predictions] NDArray)` |
 | `:early-stopping` | `{:patience n :min-delta d :restore-best? b}`; monitors validation loss, else training loss |
-| `:metrics` | `garun.metrics` keywords or `(fn [predictions truth] number)`, computed on validation every epoch in original units |
+| `:metrics` | `garun.metrics` keywords or `(fn [predictions truth] number)`, computed every epoch in original units on the validation source, or on the training source when there is none |
 | `:observe` | Function receiving one event map per epoch, then a `:finished` event. Exceptions abort training |
 | `:stop?` | Function of the epoch state; returning true stops training |
 | `:forward` | `(fn [trainer inputs training?] NDList)` replacing the forward pass |
@@ -423,7 +430,7 @@ All column groups and labels come from one table extraction, preserving row alig
 
 ```clojure
 {:history [{:epoch 1 :training-loss 0.067 :validation-loss 0.041 :best? true
-            :elapsed-milliseconds 312.0 :metrics {:mae 3.1}} …]
+            :elapsed-milliseconds 312.0 :metrics {:mae 3.1} :metrics-data :validation} …]
  :best {:epoch 24 :loss 2.8e-5 :monitor :validation-loss}
  :stopped :completed}   ; or :early-stopping
 ```
@@ -441,7 +448,7 @@ The input specification (`:x`, `:y`, `:sequence`, `:standardize`) and its comput
     (finally (session/release! current-session handle))))
 ```
 
-`epoch!` returns the next state map (`:epoch :history :best`); `validate` returns `{:loss :metrics}`. A trainer is a session resource: release it with `session/release!` or at session close.
+`epoch!` returns the next state map (`:epoch :history :best`); `validate` returns `{:loss :metrics}`. A trainer is a session resource: release it with `session/release!` or at session close. History entries with `:metrics` also carry `:metrics-data`, `:validation` or `:training`: without a validation source every epoch evaluates the training rows a second time to compute the metrics.
 
 Table sources and native DJL `Dataset` sources use the same training loop (`Trainer.iterateDataset`, gradient collector, and optimizer step). Table sources convert to `ArrayDataset` instances with seeded shuffling; native datasets remain borrowed. Best-epoch parameters are saved and restored directly on the device.
 
