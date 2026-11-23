@@ -12,6 +12,7 @@
             [garun.model-test]
             [garun.losses-test]
             [garun.optimizers-test]
+            [garun.bridges-test]
             [garun.examples-test]))
 
 (set! *warn-on-reflection* true)
@@ -30,6 +31,7 @@
                                              'garun.model-test
                                              'garun.losses-test
                                              'garun.optimizers-test
+                                             'garun.bridges-test
                                              'garun.examples-test)
         failed? (pos? (+ fail error))]
     (System/exit (if failed? 1 0))))
