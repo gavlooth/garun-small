@@ -340,8 +340,8 @@
                                 (assoc-in [:labels-by-device device] labels)
                                 (assoc-in [:predictions-by-device device] predictions))
                       collect-metrics?
-                      (-> (update :predictions into (examples/output-rows (.singletonOrThrow predictions) :raw))
-                          (update :truth into (examples/label-rows labels))))))
+                      (-> (update :predictions conj (examples/prediction-values (.singletonOrThrow predictions)))
+                          (update :truth conj (examples/label-values labels))))))
                 {:loss-sum 0.0 :count 0 :labels-by-device {} :predictions-by-device {}
                  :predictions [] :truth []}
                 (.split batch (.getDevices native-trainer) false))
@@ -385,9 +385,10 @@
         statistics (get-in handle [:specification :statistics :y])]
     (cond-> {:loss (:loss result)}
       (seq requested) (assoc :metrics
-                             (examples/metric-results requested
-                                                      (examples/inverse-targets (:predictions result) statistics)
-                                                      (examples/inverse-targets (:truth result) statistics))))))
+                             (examples/metric-results
+                              requested
+                              (examples/restore-targets (examples/join-values (:predictions result)) statistics)
+                              (examples/restore-targets (examples/join-values (:truth result)) statistics))))))
 
 (defn validate
   "Return {:loss number :metrics {...}} for the handle's validation dataset.
@@ -449,7 +450,9 @@
            entry (cond-> {:epoch epoch :training-loss (:loss training)
                           :validation-loss (when (:validation handle) (:loss validation))
                           :best? best? :elapsed-milliseconds (/ (- (System/nanoTime) start) 1.0e6)}
-                   (:metrics validation) (assoc :metrics (:metrics validation)))
+                   ;; Without a validation source the metrics describe the training rows.
+                   (:metrics validation) (assoc :metrics (:metrics validation)
+                                                :metrics-data (if (:validation handle) :validation :training)))
            next-state (cond-> (-> state
                                   (assoc :epoch epoch :stopped :completed)
                                   (update :history (fnil conj []) entry)
@@ -521,10 +524,9 @@
             (when-not (= 1 (.size result))
               (invalid :nn/non-tabular-output "Table predictions require a single output tensor"
                        {:outputs (.size result)}))
-            (let [rows (examples/output-rows (.singletonOrThrow result) output)]
-              (if (= output :raw)
-                (examples/inverse-targets rows (get-in specification [:statistics :y]))
-                rows))))))))
+            (-> (examples/prediction-values (.singletonOrThrow result))
+                (cond-> (= output :raw) (examples/restore-targets (get-in specification [:statistics :y])))
+                (examples/value-rows output))))))))
 
 (defn- predict-table [context network source options]
   (let [{:keys [output] :or {output :raw}}
@@ -574,7 +576,9 @@
       (let [handle {:native-trainer native-trainer :options {:metrics requested}}
             result (run-dataset! handle source false (boolean (seq requested)))]
         (merge {:loss (:loss result)}
-               (examples/metric-results requested (:predictions result) (:truth result)))))))
+               (examples/metric-results requested
+                                        (examples/join-values (:predictions result))
+                                        (examples/join-values (:truth result))))))))
 
 (defn- evaluate-table [^Context context network source specification requested loss-specification]
   (let [prepared (examples/table-examples context source specification true)
@@ -590,10 +594,11 @@
           (let [^NDArray value (.evaluate loss
                                           (NDList. ^"[Lai.djl.ndarray.NDArray;"
                                            (into-array NDArray [labels])) result)
-                predictions (examples/inverse-targets (examples/output-rows (.singletonOrThrow result) :raw)
+                predictions (examples/restore-targets (examples/prediction-values (.singletonOrThrow result))
                                                       (get-in specification [:statistics :y]))]
             (merge {:loss (double (aget ^"[Ljava.lang.Number;" (.toArray value) 0))}
-                   (examples/metric-results requested predictions (examples/target-rows prepared)))))))))
+                   (examples/metric-results requested predictions
+                                            (examples/matrix-values (:labels prepared))))))))))
 
 (defn evaluate
   "Evaluate aligned table examples/windows or a native Dataset.

@@ -805,6 +805,32 @@
       (.get ^CompletableFuture release (long 10) TimeUnit/SECONDS)
       (is (= :session/released (error-key #(session/resource current-session handle :trainer)))))))
 
+(deftest metrics-name-their-data-and-agree-with-predictions-in-target-units
+  (with-open [current-session (session/open {:seed 5})]
+    (let [source (regression-table)
+          row-count (table/row-count current-session source)
+          options {:x [:x] :y :y :standardize [:x :y] :epochs 2 :batch 16
+                   :metrics [:mae :mse (fn [predictions truth]
+                                         (if (= (count predictions) (count truth)) (count truth) -1))]}
+          network (nn/build current-session [:linear 1] {:input-shape [1]})
+          without-validation (nn/train! current-session network source options)
+          with-validation (nn/train! current-session network source (assoc options :validation source))
+          without-metrics (nn/train! current-session network source (dissoc options :metrics))
+          predictions (nn/predict current-session network source {})
+          truth (mapv :y (table/rows current-session source))
+          evaluation (nn/evaluate current-session network source {:metrics [:mae :mse]})
+          final-metrics (:metrics (peek (:history with-validation)))]
+      (is (= [:training :training] (mapv :metrics-data (:history without-validation))))
+      (is (= [:validation :validation] (mapv :metrics-data (:history with-validation))))
+      (is (not-any? #(contains? % :metrics-data) (:history without-metrics)))
+      (is (= row-count (:metric-2 final-metrics)))
+      ;; Metrics and predictions are both restored to the target's original units.
+      (is (< (Math/abs (double (- (:mse evaluation) (mse predictions truth)))) 1.0e-9))
+      (is (< (Math/abs (double (- (:mae evaluation)
+                                  (/ (reduce + (map #(Math/abs (- (double %1) (double %2))) predictions truth))
+                                     row-count))))
+             1.0e-9)))))
+
 (deftest custom-stopping-functional-loss-and-forward-share-the-loop
   (with-open [current-session (session/open)]
     (let [source (regression-table)

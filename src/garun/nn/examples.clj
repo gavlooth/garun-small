@@ -151,12 +151,6 @@
                                                       (:y measured)))]))
                    (:standardize specification))))))
 
-(defn- matrix-row [matrix row]
-  (let [^floats values (:data matrix)
-        width (:cols matrix)
-        offset (* row width)]
-    (map #(aget values (int (+ offset %))) (range width))))
-
 (defn- window-rows
   "Copy, for each window, the length consecutive rows that end at its end row
   into one row-major array. A window is one contiguous block of the matrix."
@@ -290,18 +284,67 @@
     (.setSampling builder (BatchSampler. sampler (int (:batch options)) false))
     (.build builder)))
 
-(defn inverse-targets
-  "Restore scalar or vector target rows from training-scale to original units."
-  [rows statistics]
+(defn- tensor-values [^NDArray array]
+  (let [shape (.getShape array)
+        cols (if (= 2 (.dimension shape)) (.getLastDimension shape) 1)
+        ^doubles data (if (= DataType/FLOAT32 (.getDataType array))
+                        (let [^floats values (.toFloatArray array)
+                              widened (double-array (alength values))]
+                          (dotimes [index (alength values)]
+                            (aset widened index (double (aget values index))))
+                          widened)
+                        (double-array (map double (.toArray array))))]
+    {:rows (if (zero? cols) 0 (quot (alength data) cols)) :cols cols :data data}))
+
+(defn prediction-values
+  "Copy rank-2 predictions to host as {:rows :cols :data double-array}, row-major."
+  [^NDArray array]
+  (when-not (= 2 (.dimension (.getShape array)))
+    (invalid :nn/non-tabular-output "Table predictions require a rank-2 output"
+             {:shape (vec (.getShape (.getShape array)))}))
+  (tensor-values array))
+
+(defn label-values
+  "Copy a singleton label NDList to host as a value matrix; labels of any other
+  rank than 2 (sparse class indices) become one column."
+  [^NDList labels]
+  (tensor-values (.singletonOrThrow labels)))
+
+(defn matrix-values
+  "Widen an extracted float32 matrix, such as table labels, to a value matrix."
+  [{:keys [rows cols] ^floats data :data}]
+  (let [widened (double-array (alength data))]
+    (dotimes [index (alength data)]
+      (aset widened index (double (aget data index))))
+    {:rows rows :cols cols :data widened}))
+
+(defn join-values
+  "Concatenate value matrices with equal column counts, such as one per batch."
+  [chunks]
+  (let [rows (long (reduce + 0 (map :rows chunks)))
+        cols (long (:cols (first chunks) 0))
+        joined (double-array (* rows cols))]
+    (reduce (fn [offset {^doubles data :data}]
+              (System/arraycopy data 0 joined (int offset) (alength data))
+              (+ (long offset) (alength data)))
+            0 chunks)
+    {:rows rows :cols cols :data joined}))
+
+(defn restore-targets
+  "Return values in original target units: each column times its training
+  standard deviation plus its training mean. Unchanged without statistics."
+  [values statistics]
   (if (seq statistics)
-    (mapv (fn [row]
-            (let [values (if (vector? row) row [row])
-                  restored (mapv (fn [value {:keys [mean standard-deviation]}]
-                                   (+ mean (* standard-deviation value)))
-                                 values statistics)]
-              (if (= 1 (count restored)) (first restored) restored)))
-          rows)
-    rows))
+    (let [^doubles data (:data values)
+          cols (long (:cols values))
+          means (double-array (map :mean statistics))
+          deviations (double-array (map :standard-deviation statistics))
+          restored (double-array (alength data))]
+      (dotimes [index (alength data)]
+        (let [column (rem index cols)]
+          (aset restored index (+ (aget means column) (* (aget deviations column) (aget data index))))))
+      (assoc values :data restored))
+    values))
 
 (defn- argmax [values]
   (let [maximum (reduce max values)]
@@ -331,33 +374,16 @@
       single? (sigmoid value)
       :else (softmax values))))
 
-(defn output-rows
-  "Read rank-2 predictions as scalar/vector rows, raw, classes, or probabilities."
-  [^NDArray array output]
-  (when-not (= 2 (.dimension (.getShape array)))
-    (invalid :nn/non-tabular-output "Table predictions require a rank-2 output"
-             {:shape (vec (.getShape (.getShape array)))}))
-  (let [width (.getLastDimension (.getShape array))
-        values (if (= DataType/FLOAT32 (.getDataType array)) (.toFloatArray array) (.toArray array))
-        rows (partition (int width) values)]
-    (mapv #(output-value (mapv double %) output) rows)))
-
-(defn label-rows
-  "Read a singleton label NDList as matrix rows or sparse class labels."
-  [^NDList labels]
-  (let [^NDArray array (.singletonOrThrow labels)
-        dimensions (.dimension (.getShape array))]
-    (if (= 2 dimensions)
-      (output-rows array :raw)
-      (mapv double (.toArray array)))))
-
-(defn target-rows
-  "Read extracted table labels in example/window order and original target units."
-  [examples]
-  (mapv (fn [index]
-          (let [row (mapv double (matrix-row (:labels examples) index))]
-            (if (= 1 (count row)) (first row) row)))
-        (range (:rows examples))))
+(defn value-rows
+  "Return one entry per row of a value matrix: raw values, classes or
+  probabilities. A single column gives scalars, several give vectors."
+  [{:keys [rows cols] ^doubles data :data} output]
+  (let [cols (long cols)]
+    (if (and (= 1 cols) (= :raw output))
+      (vec data)
+      (mapv (fn [row]
+              (output-value (mapv #(aget data (+ (* (long row) cols) (long %))) (range cols)) output))
+            (range rows)))))
 
 (def ^:private metric-functions
   {:mse metrics/mse :mae metrics/mae :r2 metrics/r2 :accuracy metrics/accuracy
@@ -371,25 +397,32 @@
   requested)
 
 (defn metric-results
-  "Align prediction/label rows for named metrics; custom metrics receive raw rows."
+  "Compute requested metrics from prediction and label value matrices in the
+  same units. Regression metrics read every value; classification metrics read
+  predicted classes or probabilities against integer labels; custom functions
+  receive one scalar or vector per row. Each form is built once and only when
+  a requested metric needs it."
   [requested predictions truth]
-  (into {}
-        (map-indexed
-         (fn [index metric]
-           (let [classification? (#{:accuracy :precision :recall :f1 :log-loss} metric)
-                 values (cond
-                          (= metric :log-loss) (mapv #(output-value (if (vector? %) % [%]) :probability) predictions)
-                          classification? (mapv #(output-value (if (vector? %) % [%]) :class) predictions)
-                          :else (vec (mapcat #(if (vector? %) % [%]) predictions)))
-                 targets (if classification? (mapv long truth)
-                             (vec (mapcat #(if (vector? %) % [%]) truth)))
-                 value (cond
-                         (fn? metric) (metric predictions truth)
-                         (and (#{:precision :recall :f1} metric)
-                              (> (count (into #{} (concat values targets))) 2))
-                         ((get metric-functions metric) values targets {:average :macro})
-                         :else ((get metric-functions metric) values targets))]
-             (when-not (number? value)
-               (invalid :nn/invalid-metric "Metric functions must return a number" {:metric metric :value value}))
-             [(if (keyword? metric) metric (keyword (str "metric-" index))) value])))
-        requested))
+  (let [all-predictions (delay (vec (:data predictions)))
+        all-truth (delay (vec (:data truth)))
+        classes (delay (value-rows predictions :class))
+        probabilities (delay (value-rows predictions :probability))
+        class-labels (delay (mapv long (:data truth)))
+        prediction-rows (delay (value-rows predictions :raw))
+        truth-rows (delay (value-rows truth :raw))]
+    (into {}
+          (map-indexed
+           (fn [index metric]
+             (let [named (get metric-functions metric)
+                   value (cond
+                           (fn? metric) (metric @prediction-rows @truth-rows)
+                           (= :log-loss metric) (named @probabilities @class-labels)
+                           (and (#{:precision :recall :f1} metric)
+                                (> (count (into #{} (concat @classes @class-labels))) 2))
+                           (named @classes @class-labels {:average :macro})
+                           (#{:accuracy :precision :recall :f1} metric) (named @classes @class-labels)
+                           :else (named @all-predictions @all-truth))]
+               (when-not (number? value)
+                 (invalid :nn/invalid-metric "Metric functions must return a number" {:metric metric :value value}))
+               [(if (keyword? metric) metric (keyword (str "metric-" index))) value])))
+          requested)))
