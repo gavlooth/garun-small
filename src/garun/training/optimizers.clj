@@ -7,7 +7,14 @@
   epsilon inside the square root, Adagrad outside. RMSProp supports momentum
   in either variant (default .9 when centered, zero otherwise). Independent
   supplied gradients are unchanged; attached parameter gradients are cleared
-  after an update, matching DJL's trainer contract."
+  after an update, matching DJL's trainer contract.
+
+  DJL's PyTorch engine has kernels only for Adam, AdamW and SGD, and those are
+  not used either. Measured on DJL 0.36: without :clip-grad they give the same
+  weights as these updates, with :clip-grad they do not (they differ by up to
+  0.28 after two steps on the reference case); they are faster on many small
+  parameters (50 x [64 64]: 195 ms against 345 ms for 200 steps) and slower on
+  large ones ([2000 2000]: about 900 ms against 650 ms for 60 steps)."
   (:import [ai.djl.training.optimizer Optimizer$OptimizerBuilder]
            [ai.djl.training.tracker ParameterTracker]
            [garun.djl TensorOptimizer TensorOptimizer$Family]))
