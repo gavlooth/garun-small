@@ -24,7 +24,7 @@
            [garun.session Session]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
-           [java.util.concurrent CompletableFuture ConcurrentLinkedQueue CountDownLatch TimeUnit TimeoutException]
+           [java.util.concurrent CompletableFuture ConcurrentLinkedQueue TimeUnit TimeoutException]
            [java.util.function Supplier]))
 
 (set! *warn-on-reflection* true)
@@ -748,7 +748,7 @@
           (is (= description (datafy/datafy handle)))
           (is (= handle (session/value current-session handle :trainer))))
         (finally (session/release! current-session handle)))
-      (is (nil? (session/resource current-session handle :trainer)))
+      (is (= :session/released (error-key #(session/resource current-session handle :trainer))))
       (is (false? (.isOpen (.getManager ^Trainer (:native-trainer handle)))))
       (is (false? (.isOpen ^NDManager (:snapshot-manager handle))))
       ;; Release already closed the handle; repeated close must remain harmless.
@@ -757,49 +757,34 @@
       (is (= [(:native-trainer handle)] (vec closed-trainers)))
       (is (= description (datafy/datafy handle))))))
 
-(deftest training-operations-synchronize-only-on-the-network
+(deftest training-operations-wait-for-the-network-and-end-with-it
   (with-open [current-session (session/open)
               worker (session/worker current-session)]
     (let [network (nn/build current-session [:linear 1] {:input-shape [1] :name :lock-order})
           handle (nn/trainer worker :lock-order (regression-table)
                              {:x [:x] :y :y :epochs 1 :batch 41})
-          exclusive session/exclusive]
-      (try
-        ;; A held network blocks every native training operation. The trainer
-        ;; remains lockable, and no operation attempts its resource lock.
-        (doseq [operation [nn/validate #(nn/epoch! % {}) #(nn/restore-best! % {})
-                           #(nn/train! (:context %) (:network %) (regression-table)
-                                       {:x [:x] :y :y :epochs 1 :batch 41})]]
-          (let [network-attempted (CountDownLatch. (int 1))
-                trainer-attempted (CountDownLatch. (int 1))]
-            (with-redefs [session/exclusive
-                          (fn [context value kind callback]
-                            (when (and (= :network kind) (identical? network value))
-                              (.countDown network-attempted))
-                            (when (and (= :trainer kind) (identical? handle value))
-                              (.countDown trainer-attempted))
-                            (exclusive context value kind callback))]
-              (let [[^CompletableFuture result ^CompletableFuture trainer-result]
-                    (exclusive
-                     current-session network :network
-                     (fn [_]
-                       (let [result (CompletableFuture/supplyAsync
-                                     (reify Supplier
-                                       (get [_] (operation handle))))]
-                         (is (.await network-attempted (long 10) TimeUnit/SECONDS))
-                         (is (thrown? TimeoutException (.get result (long 100) TimeUnit/MILLISECONDS)))
-                         (is (= 1 (.getCount trainer-attempted)))
-                         (let [trainer-result (CompletableFuture/supplyAsync
-                                               (reify Supplier
-                                                 (get [_]
-                                                   (exclusive current-session handle :trainer
-                                                              (constantly :available)))))]
-                           (is (= :available (.get trainer-result (long 1) TimeUnit/SECONDS)))
-                           [result trainer-result]))))]
-                (is (map? (.get result (long 10) TimeUnit/SECONDS)))
-                (.get trainer-result (long 10) TimeUnit/SECONDS)
-                (is (= 1 (.getCount trainer-attempted)))))))
-        (finally (session/release! current-session handle))))))
+          operations [nn/validate #(nn/epoch! % {}) #(nn/restore-best! % {})]]
+      (is (= :lock-order (:after (session/describe (session/resource current-session handle :trainer)))))
+      ;; A held network keeps every native training operation waiting until it is free.
+      (doseq [operation (conj operations
+                              #(nn/train! (:context %) (:network %) (regression-table)
+                                          {:x [:x] :y :y :epochs 1 :batch 41}))]
+        (let [^CompletableFuture result
+              (session/exclusive
+               current-session network :network
+               (fn [_]
+                 (let [result (CompletableFuture/supplyAsync
+                               (reify Supplier
+                                 (get [_] (operation handle))))]
+                   (is (thrown? TimeoutException (.get result (long 100) TimeUnit/MILLISECONDS)))
+                   result)))]
+          (is (map? (.get result (long 10) TimeUnit/SECONDS)))))
+      ;; Releasing the network releases the trainer registered after it first.
+      (session/release! current-session :lock-order)
+      (is (false? (.isOpen (.getManager ^Trainer (:native-trainer handle)))))
+      (is (= [] (session/resources current-session)))
+      (doseq [operation operations]
+        (is (= :session/released (error-key #(operation handle))))))))
 
 (deftest trainer-release-waits-for-network-users
   (with-open [current-session (session/open)]
@@ -818,7 +803,7 @@
                        (is (map? (nn/epoch! handle {})))
                        release)))]
       (.get ^CompletableFuture release (long 10) TimeUnit/SECONDS)
-      (is (nil? (session/resource current-session handle :trainer))))))
+      (is (= :session/released (error-key #(session/resource current-session handle :trainer)))))))
 
 (deftest custom-stopping-functional-loss-and-forward-share-the-loop
   (with-open [current-session (session/open)]

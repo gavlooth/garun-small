@@ -8,7 +8,8 @@
 
   Native prediction results belong to the context manager unless :manager is
   supplied. Inference shares the network lock; training uses its exclusive lock.
-  Training operations acquire network before trainer to keep one lock order.
+  A trainer is registered after its network, so the session locks the network
+  before the trainer on every path and releases the trainer before its network.
   Native datasets remain borrowed; table datasets and best-parameter snapshots
   belong to the session-owned trainer."
   (:refer-clojure :exclude [load])
@@ -244,11 +245,6 @@
   (.write writer "#garun/trainer ")
   (print-method (session/describe-value :trainer handle) writer))
 
-;; Trainer users hold the network lock; release takes it first so a release waits
-;; for a running epoch and every path orders network before trainer.
-(defmethod session/release-scope TrainingHandle [_kind handle releasing-context operation]
-  (session/exclusive releasing-context (:network handle) :network (fn [_network] (operation))))
-
 (defn trainer
   "Create a session-owned training handle. Release it with session/release! or
   leave it to session close; do not use with-open on this registered resource.
@@ -307,7 +303,10 @@
                (.prepare ^Dataset dataset)
                (when validation (.prepare ^Dataset validation))
                (when specification (examples/store-inputs! model specification))
-               (session/register! context handle {:kind :trainer}))
+               ;; A caller's unregistered network has no session lock to go after.
+               (session/register! context handle
+                                  (cond-> {:kind :trainer}
+                                    (session/resource context network :network) (assoc :after network))))
              (catch Throwable error
                (try (.close native-trainer) (finally (.close snapshot-manager)))
                (throw error)))))))))
@@ -395,7 +394,7 @@
   Without :validation, evaluate its training dataset without gradients instead.
   Keyword regression metrics and custom functions receive original target units."
   [handle]
-  (session/exclusive (:context handle) (:network handle) :network
+  (session/exclusive (:context handle) handle :trainer
                      (fn [_] (validation-result! handle))))
 
 (defn- copy-parameters! [handle restore?]
@@ -419,7 +418,7 @@
   moments are not rewound; restoring weights is normally the final training step."
   [handle state]
   (session/exclusive
-   (:context handle) (:network handle) :network
+   (:context handle) handle :trainer
    (fn [_]
      (when (:best state) (copy-parameters! handle true))
      state)))
@@ -432,7 +431,7 @@
   restore automatically, so user reductions can supply their own schedule."
   [handle state]
   (session/exclusive
-   (:context handle) (:network handle) :network
+   (:context handle) handle :trainer
    (fn [_]
      (when-not (map? state)
        (invalid :nn/invalid-state "Epoch state must be a map" {:state state}))

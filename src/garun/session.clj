@@ -10,6 +10,13 @@
   duplicated connections and tensor sub-managers; predictions may share a
   registered network while training takes its exclusive resource lock.
 
+  Every path takes locks in one order: the session lifecycle lock, then the
+  Resource a value was registered :after, then the value's own Resource, then
+  the registry lock. A resource registered :after another is always locked in
+  the same mode as that other one first, so users of a trainer and users of its
+  network cannot wait on each other in opposite orders. Releasing a resource
+  first releases everything registered after it.
+
   Final atom and lock fields own the synchronous native-lifetime invariants.
   Reentrant read/write locks wait for blocking JDBC/DJL calls before cleanup;
   registry replacement excludes observers until old-value cleanup completes.
@@ -27,6 +34,7 @@
            [clojure.lang Atom]
            [java.io Writer]
            [java.lang AutoCloseable]
+           [java.lang.ref WeakReference]
            [java.sql Connection DriverManager]
            [java.util UUID]
            [java.util.concurrent.locks Lock ReentrantReadWriteLock]
@@ -34,7 +42,16 @@
 
 (set! *warn-on-reflection* true)
 
-(declare begin-operation! end-operation! close-session! close-worker! close-resource! describe)
+(declare admitted close-session! close-worker! close-resource! describe)
+
+(defmacro ^:private with-lock
+  "Run body holding lock; the lock is released when body returns or throws."
+  [lock & body]
+  `(let [^Lock lock# ~lock]
+     (.lock lock#)
+     (try
+       ~@body
+       (finally (.unlock lock#)))))
 
 (deftype Session [identifier schema ^DuckDBConnection connection ^NDManager manager defaults
                   ;; Shutdown waits for all admitted operations, including reentrant calls.
@@ -50,16 +67,15 @@
                   ;; Table identifiers never collide within this generated schema.
                   ^Atom next-table-identifier
                   ;; A closed session never admits another operation or repeats cleanup.
-                  ^Atom closed]
+                  ^Atom closed
+                  ;; Weak references to owned values this session released, so that reusing
+                  ;; one is reported instead of being run as a caller's unregistered object.
+                  ^Atom released-values]
   context/Context
   (connection [_] connection)
   (manager [_] manager)
   (owner [current-session] current-session)
-  (call [current-session operation]
-    (begin-operation! current-session)
-    (try
-      (operation)
-      (finally (end-operation! current-session))))
+  (call [current-session operation] (admitted current-session operation))
   AutoCloseable
   (close [current-session] (close-session! current-session))
   protocols/Datafiable
@@ -76,21 +92,20 @@
   (owner [_] parent)
   (call [_ operation]
     ;; Session-before-worker admission lets shutdown safely close idle workers.
-    (begin-operation! parent)
-    (.lock (.readLock lifecycle-lock))
-    (try
-      (when @closed
-        (throw (ex-info "Worker is closed" {:error :session/closed :worker true})))
-      (operation)
-      (finally
-        (.unlock (.readLock lifecycle-lock))
-        (end-operation! parent))))
+    (admitted parent
+              (fn []
+                (with-lock (.readLock lifecycle-lock)
+                  (when @closed
+                    (throw (ex-info "Worker is closed" {:error :session/closed :worker true})))
+                  (operation)))))
   AutoCloseable
   (close [current-worker] (close-worker! current-worker))
   protocols/Datafiable
   (datafy [current-worker] (describe current-worker)))
 
 (deftype Resource [name identifier kind value owned?
+                   ;; The Resource this one was registered :after, or nil. Its lock is taken first.
+                   after
                    ;; Mutation and release wait until every shared operation has finished.
                    ^ReentrantReadWriteLock resource-lock
                    ;; A released resource rejects all operations and repeats no cleanup.
@@ -105,6 +120,7 @@
       :kind kind
       :value value
       :owned? owned?
+      :after after
       :released? @released
       not-found))
   AutoCloseable
@@ -133,16 +149,14 @@
     (catch Throwable close-failure
       (append-failure! failure close-failure))))
 
-(defn- begin-operation! [^Session current-session]
-  (let [^ReentrantReadWriteLock lifecycle-lock (.-lifecycle-lock current-session)]
-    (.lock (.readLock lifecycle-lock))
+(defn- admitted
+  "Run operation while the session is open; closing the session waits for it."
+  [^Session current-session operation]
+  (with-lock (.readLock ^ReentrantReadWriteLock (.-lifecycle-lock current-session))
     (when @(.-closed current-session)
-      (.unlock (.readLock lifecycle-lock))
       (throw (ex-info "Session is closed"
-                      {:error :session/closed :identifier (.-identifier current-session)})))))
-
-(defn- end-operation! [^Session current-session]
-  (.unlock (.readLock ^ReentrantReadWriteLock (.-lifecycle-lock current-session))))
+                      {:error :session/closed :identifier (.-identifier current-session)})))
+    (operation)))
 
 (defmulti describe-value
   "Return plain, non-owning data about a resource value, dispatched by kind."
@@ -160,62 +174,75 @@
   (when (instance? AutoCloseable value)
     (.close ^AutoCloseable value)))
 
-(defmulti release-scope
-  "Run operation, which releases value through context, inside any locks that the
-  value's users take before its own Resource lock. Values whose users lock another
-  resource first (trainers lock their network) extend this to keep one lock order."
-  (fn [_kind value _context _operation] (class value)))
+(def ^:private exclusive-lock-refusals
+  {:exclusive [:session/exclusive-inside-shared
+               "Cannot take exclusive access to a resource inside its shared operation"]
+   :release [:session/close-inside-operation
+             "Cannot release a resource inside its shared operation"]})
 
-(defmethod release-scope :default [_kind _value _context operation]
-  (operation))
-
-(defn- lock-for-release! [^Resource resource]
+(defn- holding-own-lock
+  "Run operation holding resource's own lock: shared for :shared, exclusive for
+  :exclusive and :release. A thread inside a shared operation on resource is
+  refused instead of waiting forever for its own shared lock to be released."
+  [^Resource resource mode operation]
   (let [^ReentrantReadWriteLock resource-lock (.-resource-lock resource)]
-    (when (and (pos? (.getReadHoldCount resource-lock))
-               (not (.isWriteLockedByCurrentThread resource-lock)))
-      (throw (ex-info "Cannot release a resource inside its shared operation"
-                      {:error :session/close-inside-operation :name (.-name resource)})))
-    (.lock (.writeLock resource-lock))))
+    (if (= :shared mode)
+      (with-lock (.readLock resource-lock) (operation))
+      (do
+        (when (and (pos? (.getReadHoldCount resource-lock))
+                   (not (.isWriteLockedByCurrentThread resource-lock)))
+          (let [[error message] (get exclusive-lock-refusals mode)]
+            (throw (ex-info message {:error error :name (.-name resource)}))))
+        (with-lock (.writeLock resource-lock) (operation))))))
+
+(defn- holding
+  "Run operation holding, in the same mode, the lock of every resource this one
+  was registered after, the earliest registration outermost, then its own lock."
+  [^Resource resource mode operation]
+  (if-let [dependency (.-after resource)]
+    (holding dependency mode #(holding-own-lock resource mode operation))
+    (holding-own-lock resource mode operation)))
 
 (defn- close-resource! [^Resource resource releasing-context]
-  (lock-for-release! resource)
-  (try
-    (when-not @(.-released resource)
-      (reset! (.-released resource) true)
-      (when (.-owned? resource)
-        (release-value! (.-kind resource) (.-value resource) releasing-context)))
-    (finally (.unlock (.writeLock ^ReentrantReadWriteLock (.-resource-lock resource))))))
+  (holding-own-lock
+   resource :release
+   (fn []
+     (when-not @(.-released resource)
+       (reset! (.-released resource) true)
+       (when (.-owned? resource)
+         (release-value! (.-kind resource) (.-value resource) releasing-context))))))
 
-(defn- resource-call [^Resource resource shared? operation]
-  (let [^ReentrantReadWriteLock resource-lock (.-resource-lock resource)
-        ^Lock operation-lock (if shared? (.readLock resource-lock) (.writeLock resource-lock))]
-    (.lock operation-lock)
-    (try
-      (when @(.-released resource)
-        (throw (ex-info "Resource has been released"
-                        {:error :session/released :name (.-name resource) :kind (.-kind resource)})))
-      (operation (.-value resource))
-      (finally (.unlock operation-lock)))))
+(defn- released-failure [^Resource resource]
+  (ex-info "Resource has been released"
+           {:error :session/released :name (.-name resource) :kind (.-kind resource)}))
+
+(defn- resource-call [^Resource resource mode operation]
+  (holding resource mode
+           (fn []
+             (when @(.-released resource)
+               (throw (released-failure resource)))
+             (operation (.-value resource)))))
 
 (defn shared-resource
-  "Run an operation under a registered Resource's shared lock, rejecting release."
+  "Run an operation under a registered Resource's shared lock, rejecting release.
+  The resource it was registered :after is locked shared first."
   [resource operation]
-  (resource-call resource true operation))
+  (resource-call resource :shared operation))
 
 (defn exclusive-resource
-  "Run an operation under a registered Resource's exclusive lock, rejecting release."
+  "Run an operation under a registered Resource's exclusive lock, rejecting release.
+  The resource it was registered :after is locked exclusively first. Calling this
+  inside a shared operation on the same resource throws
+  :session/exclusive-inside-shared."
   [resource operation]
-  (resource-call resource false operation))
+  (resource-call resource :exclusive operation))
 
 (defn resources
   "Snapshot a session's registry in registration order, including after close."
   [current-context]
-  (let [^Session current-session (context/owner current-context)
-        ^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
-    (.lock (.readLock registry-lock))
-    (try
-      (->> @(.-registry current-session) vals (sort-by #(.-identifier ^Resource %)) vec)
-      (finally (.unlock (.readLock registry-lock))))))
+  (let [^Session current-session (context/owner current-context)]
+    (with-lock (.readLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+      (->> @(.-registry current-session) vals (sort-by #(.-identifier ^Resource %)) vec))))
 
 (sql/register-clause! :garun/create-schema
                       (fn [_ schema] [(str "CREATE SCHEMA " (sql/format-entity schema))])
@@ -235,34 +262,27 @@
     (when (pos? (.getReadHoldCount lifecycle-lock))
       (throw (ex-info "Cannot close a worker inside its operation"
                       {:error :session/close-inside-operation :worker true})))
-    (.lock (.writeLock lifecycle-lock))
-    (try
+    (with-lock (.writeLock lifecycle-lock)
       (when-not @(.-closed current-worker)
         (reset! (.-closed current-worker) true)
         (let [failure (-> nil
                           (close-after! (.-manager current-worker))
                           (close-after! (.-connection current-worker)))]
           (swap! (.-workers ^Session (.-parent current-worker)) disj current-worker)
-          (when failure (throw failure))))
-      (finally (.unlock (.writeLock lifecycle-lock))))))
+          (when failure (throw failure)))))))
 
 (defn- close-session! [^Session current-session]
-  (let [^ReentrantReadWriteLock lifecycle-lock (.-lifecycle-lock current-session)
-        ^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
+  (let [^ReentrantReadWriteLock lifecycle-lock (.-lifecycle-lock current-session)]
     (when (pos? (.getReadHoldCount lifecycle-lock))
       (throw (ex-info "Cannot close a session inside an operation"
                       {:error :session/close-inside-operation :identifier (.-identifier current-session)})))
-    (.lock (.writeLock lifecycle-lock))
-    (try
+    (with-lock (.writeLock lifecycle-lock)
       (when-not @(.-closed current-session)
         (reset! (.-closed current-session) true)
         (let [worker-failure (reduce close-after! nil @(.-workers current-session))
               snapshot (resources current-session)
-              _ (do
-                  (.lock (.writeLock registry-lock))
-                  (try
-                    (reset! (.-registry current-session) {})
-                    (finally (.unlock (.writeLock registry-lock)))))
+              _ (with-lock (.writeLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+                  (reset! (.-registry current-session) {}))
               resource-failure (reduce close-after! worker-failure (rseq snapshot))
               schema-failure (try
                                (schema-ddl! (.-connection current-session) :garun/drop-schema
@@ -272,8 +292,7 @@
               failure (-> schema-failure
                           (close-after! (.-manager current-session))
                           (close-after! (.-connection current-session)))]
-          (when failure (throw failure))))
-      (finally (.unlock (.writeLock lifecycle-lock))))))
+          (when failure (throw failure)))))))
 
 (defn open
   "Open an owned Session; close it with with-open.
@@ -309,7 +328,7 @@
            schema (str "garun_" identifier)
            current-session (Session. identifier schema connection manager native-defaults
                                      (ReentrantReadWriteLock. true) (ReentrantReadWriteLock. true)
-                                     (atom {}) (atom #{}) (atom 0) (atom 0) (atom false))]
+                                     (atom {}) (atom #{}) (atom 0) (atom 0) (atom false) (atom []))]
        (try
          (schema-ddl! connection :garun/create-schema schema)
          current-session
@@ -375,53 +394,165 @@
   (or (#{:network :model :table :trainer} kind)
       (invalid! :session/invalid-kind "Resource kind must be :network, :model, :table, or :trainer" kind)))
 
-(defn- named-resource [^Session current-session resource-name]
-  (let [^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
-    (.lock (.readLock registry-lock))
-    (try
-      (get @(.-registry current-session) resource-name)
-      (finally (.unlock (.readLock registry-lock))))))
+(defn- registry-key [^Resource resource]
+  (or (.-name resource) (.-identifier resource)))
 
-(defn- install-resource! [^Session current-session resource-name kind value owned?]
+(defn- released-by-session? [^Session current-session object]
+  (boolean (some #(identical? object (.get ^WeakReference %)) @(.-released-values current-session))))
+
+(defn- registered
+  "Return the Resource registered under a keyword name or holding this exact
+  object, or nil for an object this session never registered: its caller owns
+  and synchronizes it. Unknown names, owned objects this session has released,
+  and a kind other than the non-nil expected kind throw."
+  ^Resource [^Session current-session object-or-name kind]
+  (let [named? (keyword? object-or-name)
+        ^Resource found (with-lock (.readLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+                          (let [registry @(.-registry current-session)]
+                            (if named?
+                              (get registry object-or-name)
+                              (some (fn [^Resource resource]
+                                      (when (identical? (.-value resource) object-or-name) resource))
+                                    (vals registry)))))]
+    (cond
+      (and (nil? found) named?)
+      (throw (ex-info "Resource is not registered" {:error :session/unknown-name :name object-or-name}))
+
+      (and (nil? found) (released-by-session? current-session object-or-name))
+      (throw (ex-info "Resource has been released" {:error :session/released :kind kind}))
+
+      (nil? found) nil
+
+      (and kind (not= kind (.-kind found)))
+      (throw (ex-info "Resource has a different kind"
+                      {:error :session/wrong-kind :name (.-name found) :kind (.-kind found) :expected kind}))
+
+      :else found)))
+
+(defn- remember-released!
+  "Record the owned values of resources leaving the registry; the caller holds
+  the registry's exclusive lock. References whose value was collected are dropped."
+  [^Session current-session resources]
+  (swap! (.-released-values current-session)
+         (fn [references]
+           (into (filterv #(some? (.get ^WeakReference %)) references)
+                 (comp (filter #(.-owned? ^Resource %))
+                       (map #(WeakReference. (.-value ^Resource %))))
+                 resources))))
+
+(defn- registered-after
+  "List, in registration order, the resources registered directly after resource."
+  [^Session current-session ^Resource resource]
+  (filterv #(identical? resource (.-after ^Resource %)) (resources current-session)))
+
+(defn- holding-registered-after
+  "Run (operation locked) with every resource registered after resource, directly
+  or through another, exclusively locked. The caller already holds resource's
+  exclusive lock, which stops new registrations after it, so each listing is
+  complete once its own dependency is locked. locked starts with resource and
+  lists every other resource later than the one it was registered after."
+  [^Session current-session ^Resource resource operation]
+  (letfn [(hold [pending locked]
+            (if-let [dependent (first pending)]
+              (holding-own-lock dependent :release
+                                #(hold (into (vec (rest pending))
+                                             (registered-after current-session dependent))
+                                       (conj locked dependent)))
+              (operation locked)))]
+    (hold (registered-after current-session resource) [resource])))
+
+(defn- holding-new-dependency
+  "Run operation holding the shared lock of the resource a new registration
+  goes after, so that resource cannot be released before the registration is in
+  the registry. nil means the new registration goes after nothing."
+  [^Resource after operation]
+  (if after
+    (holding after :shared operation)
+    (operation)))
+
+(defn- install-resource!
+  "Add a new registry entry. The caller holds the registry's exclusive lock and,
+  when after is given, after's shared lock."
+  [^Session current-session resource-name kind value owned? ^Resource after]
+  (when (and after @(.-released after))
+    (throw (released-failure after)))
   (let [identifier (swap! (.-next-resource-identifier current-session) unchecked-inc)
-        resource (Resource. resource-name identifier kind value owned? (ReentrantReadWriteLock. true) (atom false))]
+        resource (Resource. resource-name identifier kind value owned? after
+                            (ReentrantReadWriteLock. true) (atom false))]
     (swap! (.-registry current-session) assoc (or resource-name identifier) resource)
     resource))
 
-(defn- replace-resource! [^Session current-session resource-name kind value owned? releasing-context]
-  ;; Resource-before-registry ordering lets in-flight callbacks resolve other names.
-  ;; Retry only when a concurrent registry mutation changed the admission candidate.
-  (let [^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
+;; Returned instead of a result when the registry changed between looking a
+;; resource up and locking it, so the caller looks it up again.
+(def ^:private look-up-again (Object.))
+
+(defn- remove-and-release!
+  "Remove resource and everything registered after it from the registry, release
+  them (later registrations first), then return (afterwards) while the registry
+  is still exclusively locked. new-dependency is the Resource a replacement goes
+  after, or nil. Returns look-up-again when resource is no longer the registered
+  entry. A failed release leaves the entries removed and propagates without
+  calling afterwards."
+  [^Session current-session ^Resource resource releasing-context ^Resource new-dependency afterwards]
+  (holding
+   resource :release
+   (fn []
+     (holding-registered-after
+      current-session resource
+      (fn [locked]
+        (holding-new-dependency
+         new-dependency
+         (fn []
+           (with-lock (.writeLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+             (if-not (identical? resource (get @(.-registry current-session) (registry-key resource)))
+               look-up-again
+               (do
+                 (swap! (.-registry current-session) #(apply dissoc % (map registry-key locked)))
+                 (remember-released! current-session locked)
+                 (when-let [failure (reduce (fn [failure dependent]
+                                              (try
+                                                (close-resource! dependent releasing-context)
+                                                failure
+                                                (catch Throwable release-failure
+                                                  (append-failure! failure release-failure))))
+                                            nil (rseq locked))]
+                   (throw failure))
+                 (afterwards)))))))))))
+
+(defn- replace-resource!
+  "Release whatever is registered under resource-name and register value in its
+  place as one registry change; retries when another thread changed that entry."
+  [^Session current-session resource-name kind value owned? ^Resource after releasing-context]
+  (let [install #(install-resource! current-session resource-name kind value owned? after)]
     (loop []
-      (let [^Resource previous (named-resource current-session resource-name)
-            attempt (fn []
-                      (when previous (lock-for-release! previous))
-                      (try
-                        (.lock (.writeLock registry-lock))
-                        (try
-                          (if-not (identical? previous (get @(.-registry current-session) resource-name))
-                            ::retry
-                            (do
-                              (when previous
-                                (swap! (.-registry current-session) dissoc resource-name)
-                                (close-resource! previous releasing-context))
-                              (install-resource! current-session resource-name kind value owned?)))
-                          (finally (.unlock (.writeLock registry-lock))))
-                        (finally
-                          (when previous (.unlock (.writeLock ^ReentrantReadWriteLock (.-resource-lock previous)))))))
+      (let [^Resource previous (with-lock (.readLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+                                 (get @(.-registry current-session) resource-name))
             result (if previous
-                     (release-scope (.-kind previous) (.-value previous) releasing-context attempt)
-                     (attempt))]
-        (if (= ::retry result) (recur) result)))))
+                     (remove-and-release! current-session previous releasing-context after install)
+                     (holding-new-dependency
+                      after
+                      (fn []
+                        (with-lock (.writeLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+                          (if (contains? @(.-registry current-session) resource-name)
+                            look-up-again
+                            (install))))))]
+        (if (identical? look-up-again result)
+          (recur)
+          result)))))
 
 (defn register!
   "Register value in context's session and return it.
   :kind is one of :network, :model, :table, or :trainer. Optional :name is a keyword;
   :owned? defaults to true and :replace? to false. Owned values close on
   release/session close; borrowed ones do not. Replacement releases the previous
-  value before registering the new one; owned tables drop on context's connection."
+  value before registering the new one; owned tables drop on context's connection.
+
+  Optional :after names a registered value (keyword or object) that every user of
+  the new value needs too, as a trainer needs its network. Operations on the new
+  value then lock that one first in the same mode, and releasing or replacing that
+  one releases the new value first."
   [current-context value options]
-  (options! options #{:kind :name :owned? :replace?})
+  (options! options #{:kind :name :owned? :replace? :after})
   (let [kind (resource-kind (:kind options))
         resource-name (:name options)
         owned? (get options :owned? true)
@@ -432,116 +563,107 @@
       (invalid! :session/invalid-options ":owned? must be boolean" owned?))
     (when-not (boolean? replace?)
       (invalid! :session/invalid-options ":replace? must be boolean" replace?))
+    (when (and (contains? options :after) (nil? (:after options)))
+      (invalid! :session/invalid-options ":after must be a registered name or object" nil))
     (context/call
      current-context
      (fn []
        (when (nil? value)
          (throw (ex-info "A resource value cannot be null" {:error :session/invalid-resource})))
        (let [^Session current-session (context/owner current-context)
-             ^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
+             after (when (contains? options :after)
+                     (or (registered current-session (:after options) nil)
+                         (throw (ex-info ":after must be registered in this session"
+                                         {:error :session/unregistered}))))]
          (if (and resource-name replace?)
-           (replace-resource! current-session resource-name kind value owned? current-context)
-           (do
-             (.lock (.writeLock registry-lock))
-             (try
-               (when (and resource-name (contains? @(.-registry current-session) resource-name))
-                 (throw (ex-info "Resource name is already registered"
-                                 {:error :session/duplicate-name :name resource-name})))
-               (install-resource! current-session resource-name kind value owned?)
-               (finally (.unlock (.writeLock registry-lock)))))))))
+           (replace-resource! current-session resource-name kind value owned? after current-context)
+           (holding-new-dependency
+            after
+            (fn []
+              (with-lock (.writeLock ^ReentrantReadWriteLock (.-registry-lock current-session))
+                (when (and resource-name (contains? @(.-registry current-session) resource-name))
+                  (throw (ex-info "Resource name is already registered"
+                                  {:error :session/duplicate-name :name resource-name})))
+                (install-resource! current-session resource-name kind value owned? after))))))))
     value))
 
-(defn- lookup-resource [registry value]
-  (some (fn [^Resource resource] (when (identical? (.-value resource) value) resource)) (vals registry)))
-
 (defn resource
-  "Resolve a keyword name or identity-look up an object in context's registry.
-  Unregistered objects return nil and remain borrowed; names must match kind."
+  "Return the Resource registered under a keyword name or holding this exact
+  object, checking its kind. Objects this session never registered return nil
+  and remain their caller's. Unknown names throw :session/unknown-name; owned
+  objects this session has released throw :session/released."
   ^Resource [current-context value kind]
+  (resource-kind kind)
+  (context/call current-context
+                #(registered (context/owner current-context) value kind)))
+
+(defn value
+  "Resolve a keyword resource name, checking its kind; objects pass through
+  unchanged unless this session has released them. Does not transfer ownership."
+  [current-context object-or-name kind]
+  (if-let [found (resource current-context object-or-name kind)]
+    (.-value found)
+    object-or-name))
+
+(defn- registered-call
+  "Run operation on a value under context's lifecycle lock and, when the value
+  is registered, its resource locks in mode. A keyword name whose resource was
+  replaced between lookup and locking is looked up again. Objects this session
+  never registered run unlocked: their caller synchronizes them."
+  [current-context object-or-name kind mode operation]
   (resource-kind kind)
   (context/call
    current-context
    (fn []
-     (let [^Session current-session (context/owner current-context)
-           ^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
-       (.lock (.readLock registry-lock))
-       (try
-         (let [registry @(.-registry current-session)
-               ^Resource registered (if (keyword? value) (get registry value) (lookup-resource registry value))]
-           (when (and (keyword? value) (nil? registered))
-             (throw (ex-info "Resource is not registered" {:error :session/unknown-name :name value})))
-           (when (and (keyword? value) (not= kind (.-kind registered)))
-             (throw (ex-info "Resource has a different kind"
-                             {:error :session/wrong-kind :name value :kind (.-kind registered) :expected kind})))
-           registered)
-         (finally (.unlock (.readLock registry-lock))))))))
-
-(defn value
-  "Resolve a keyword resource name; object values pass through unchanged.
-  Does not transfer ownership; a named resource must match kind."
-  [current-context object-or-name kind]
-  (if (keyword? object-or-name)
-    (.-value ^Resource (resource current-context object-or-name kind))
-    object-or-name))
+     (let [^Session current-session (context/owner current-context)]
+       (loop []
+         (let [^Resource found (registered current-session object-or-name kind)
+               result (if found
+                        (holding found mode
+                                 #(if @(.-released found)
+                                    look-up-again
+                                    (operation (.-value found))))
+                        (operation object-or-name))]
+           (cond
+             (not (identical? look-up-again result)) result
+             (keyword? object-or-name) (recur)
+             :else (throw (released-failure found)))))))))
 
 (defn shared
-  "Invoke operation on a borrowed value under context's lifecycle read lock.
-  Registered values additionally use their shared resource lock; callers must
-  synchronize unregistered borrowed values themselves."
+  "Invoke operation on a value under context's lifecycle lock. Registered values
+  (keyword name or object) additionally hold their shared resource lock; callers
+  must synchronize objects they never registered themselves. Owned objects this
+  session has released throw :session/released."
   [current-context object-or-name kind operation]
-  (context/call current-context
-                #(if-let [registered (resource current-context object-or-name kind)]
-                   (shared-resource registered operation)
-                   (operation object-or-name))))
+  (registered-call current-context object-or-name kind :shared operation))
 
 (defn exclusive
-  "Invoke operation on a borrowed value under context's lifecycle read lock.
-  Registered values additionally use their exclusive mutation lock; callers must
-  synchronize unregistered borrowed values themselves."
+  "Invoke operation on a value under context's lifecycle lock. Registered values
+  (keyword name or object) additionally hold their exclusive resource lock;
+  callers must synchronize objects they never registered themselves. Owned
+  objects this session has released throw :session/released; calling this
+  inside a shared operation on the same value throws
+  :session/exclusive-inside-shared."
   [current-context object-or-name kind operation]
-  (context/call current-context
-                #(if-let [registered (resource current-context object-or-name kind)]
-                   (exclusive-resource registered operation)
-                   (operation object-or-name))))
+  (registered-call current-context object-or-name kind :exclusive operation))
 
 (defn release!
-  "Unregister and release a keyword name or registered object in context's session.
-  Closes owned AutoCloseable values; owned tables drop on context's connection.
-  Borrowed values remain caller-owned."
+  "Unregister and release a keyword name or registered object in context's session,
+  after releasing everything registered :after it. Closes owned AutoCloseable
+  values; owned tables drop on context's connection. Borrowed values remain
+  caller-owned."
   [current-context object-or-name]
   (context/call
    current-context
    (fn []
-     (let [^Session current-session (context/owner current-context)
-           ^ReentrantReadWriteLock registry-lock (.-registry-lock current-session)]
+     (let [^Session current-session (context/owner current-context)]
        (loop []
-         (let [^Resource registered (do
-                                      (.lock (.readLock registry-lock))
-                                      (try
-                                        (let [registry @(.-registry current-session)]
-                                          (if (keyword? object-or-name)
-                                            (get registry object-or-name)
-                                            (lookup-resource registry object-or-name)))
-                                        (finally (.unlock (.readLock registry-lock)))))
-               _ (when-not registered
-                   (throw (ex-info "Resource is not registered"
-                                   {:error :session/unknown-name :name object-or-name})))
-               result (release-scope
-                       (.-kind registered) (.-value registered) current-context
-                       (fn []
-                         (lock-for-release! registered)
-                         (try
-                           (.lock (.writeLock registry-lock))
-                           (try
-                             (let [registry-key (or (.-name registered) (.-identifier registered))]
-                               (if-not (identical? registered (get @(.-registry current-session) registry-key))
-                                 ::retry
-                                 (do
-                                   (swap! (.-registry current-session) dissoc registry-key)
-                                   (close-resource! registered current-context))))
-                             (finally (.unlock (.writeLock registry-lock))))
-                           (finally (.unlock (.writeLock ^ReentrantReadWriteLock (.-resource-lock registered)))))))]
-           (when (= ::retry result) (recur)))))))
+         (let [found (or (registered current-session object-or-name nil)
+                         (throw (ex-info "Resource is not registered"
+                                         {:error :session/unknown-name :name object-or-name})))]
+           (when (identical? look-up-again
+                             (remove-and-release! current-session found current-context nil (constantly nil)))
+             (recur)))))))
   nil)
 
 (defn- device-data [^Device device]
@@ -549,7 +671,8 @@
 
 (defn describe
   "Inspect Session, Worker or Resource as plain data without transferring ownership.
-  Inspection remains available after closing a context or releasing a resource."
+  Inspection remains available after closing a context or releasing a resource.
+  A resource registered :after another reports that one's name or identifier."
   [value]
   (cond
     (instance? Session value)
@@ -571,13 +694,14 @@
      :status (if (closed? value) :closed :open)}
 
     (instance? Resource value)
-    (let [^Resource registered value]
-      (merge {:identifier (.-identifier registered)
-              :name (.-name registered)
-              :kind (.-kind registered)
-              :owned? (.-owned? registered)
-              :released? @(.-released registered)}
-             (describe-value (.-kind registered) (.-value registered))))
+    (let [^Resource found value]
+      (merge (cond-> {:identifier (.-identifier found)
+                      :name (.-name found)
+                      :kind (.-kind found)
+                      :owned? (.-owned? found)
+                      :released? @(.-released found)}
+               (.-after found) (assoc :after (registry-key (.-after found))))
+             (describe-value (.-kind found) (.-value found))))
 
     :else
     (invalid! :session/invalid-description "Expected Session, Worker, or Resource" value)))

@@ -128,6 +128,9 @@
         (is (identical? first-value (session/value current-session first-value :network)))
         (is (nil? (session/resource current-session unregistered :network)))
         (is (identical? unregistered (session/value current-session unregistered :network)))
+        (is (identical? unregistered (session/shared current-session unregistered :network identity)))
+        (is (identical? unregistered (session/exclusive current-session unregistered :network identity)))
+        (is (= :session/wrong-kind (error-code #(session/resource current-session first-value :model))))
         (is (= :session/duplicate-name
                (error-code #(session/register! current-session replacement {:kind :network :name :network}))))
         (is (.isEmpty recording))
@@ -139,7 +142,13 @@
         (is (= [:first] (vec recording)))
         (is (:released? resource))
         (is (= :session/released (error-code #(session/shared-resource resource identity))))
-        (is (= :session/released (error-code #(session/exclusive-resource resource identity)))))
+        (is (= :session/released (error-code #(session/exclusive-resource resource identity))))
+        ;; A released object is not a caller's unregistered one: it never runs unlocked.
+        (is (= :session/released (error-code #(session/shared current-session first-value :network identity))))
+        (is (= :session/released (error-code #(session/exclusive current-session first-value :network identity))))
+        (is (= :session/released (error-code #(session/resource current-session first-value :network))))
+        (is (= :session/released (error-code #(session/value current-session first-value :network))))
+        (is (= :session/released (error-code #(session/release! current-session first-value)))))
       (session/register! current-session anonymous {:kind :network})
       (session/register! current-session borrowed {:kind :network :name :borrowed :owned? false})
       (let [^Resource anonymous-resource (session/resource current-session anonymous :network)
@@ -152,6 +161,9 @@
       (is (= [:first :replacement] (vec recording)))
       (is (= :session/unknown-name (error-code #(session/resource current-session :network :network))))
       (is (= :session/unknown-name (error-code #(session/release! current-session unregistered))))
+      ;; Releasing a borrowed registration hands the object back to its caller.
+      (session/release! current-session :borrowed)
+      (is (identical? borrowed (session/shared current-session borrowed :network identity)))
       (is (nil? (session/release! current-session anonymous)))
       (is (= [:first :replacement :anonymous] (vec recording)))
       (.close current-session)
@@ -367,7 +379,96 @@
     (is (nil? (session/exclusive current-session :read-locked :network
                                  (fn [_] (session/release! current-session :read-locked)))))
     (is (= :session/unknown-name
-           (error-code #(session/resource current-session :read-locked :network))))))
+           (error-code #(session/resource current-session :read-locked :network))))
+    (session/register! current-session (Object.) {:kind :network :name :upgraded})
+    ;; Waiting for an exclusive lock inside one's own shared operation would never end.
+    (is (= :session/exclusive-inside-shared
+           (error-code #(session/shared current-session :upgraded :network
+                                        (fn [_] (session/exclusive current-session :upgraded :network identity))))))
+    (is (= :session/exclusive-inside-shared
+           (error-code #(session/shared-resource
+                         (session/resource current-session :upgraded :network)
+                         (fn [_] (session/exclusive-resource
+                                  (session/resource current-session :upgraded :network) identity))))))
+    (is (= :nested (session/exclusive current-session :upgraded :network
+                                      (fn [_] (session/shared current-session :upgraded :network
+                                                              (constantly :nested))))))
+    (is (= :nested (session/exclusive current-session :upgraded :network
+                                      (fn [_] (session/exclusive current-session :upgraded :network
+                                                                 (constantly :nested))))))))
+
+(deftest named-operations-follow-a-replacement-made-while-they-waited
+  (with-open [current-session (session/open)
+              current-worker (session/worker current-session)]
+    (let [recording (ConcurrentLinkedQueue.)
+          previous (recorded-resource recording :previous)
+          replacement (recorded-resource recording :replacement)]
+      (session/register! current-session previous {:kind :network :name :replaced-while-waiting})
+      (let [^CompletableFuture waiting
+            (session/exclusive
+             current-session :replaced-while-waiting :network
+             (fn [_]
+               (let [waiting (CompletableFuture/supplyAsync
+                              (reify Supplier
+                                (get [_]
+                                  (session/shared current-worker :replaced-while-waiting :network identity))))]
+                 ;; The reader has resolved the name and now waits for the previous resource.
+                 (is (thrown? TimeoutException (.get waiting (long 200) TimeUnit/MILLISECONDS)))
+                 (session/register! current-session replacement
+                                    {:kind :network :name :replaced-while-waiting :replace? true})
+                 waiting)))]
+        (is (identical? replacement (.get waiting (long 5) TimeUnit/SECONDS)))
+        (is (= [:previous] (vec recording)))))))
+
+(deftest resources-registered-after-another-share-its-lock-order-and-lifetime
+  (with-open [current-session (session/open)
+              current-worker (session/worker current-session)]
+    (let [recording (ConcurrentLinkedQueue.)
+          network (recorded-resource recording :network)
+          trainer (recorded-resource recording :trainer)
+          snapshot (recorded-resource recording :snapshot)]
+      (session/register! current-session network {:kind :network :name :network})
+      (session/register! current-session trainer {:kind :trainer :name :trainer :after :network})
+      (session/register! current-session snapshot {:kind :model :after trainer})
+      (is (= :network (:after (session/describe (session/resource current-session :trainer :trainer)))))
+      (is (identical? (session/resource current-session :network :network)
+                      (:after (session/resource current-session :trainer :trainer))))
+      (is (nil? (:after (session/resource current-session :network :network))))
+      (is (= :session/unknown-name
+             (error-code #(session/register! current-session (Object.) {:kind :trainer :after :missing}))))
+      (is (= :session/unregistered
+             (error-code #(session/register! current-session (Object.) {:kind :trainer :after (Object.)}))))
+      (is (= :session/invalid-options
+             (error-code #(session/register! current-session (Object.) {:kind :trainer :after nil}))))
+      ;; Whoever holds the network also keeps out users of what was registered after it.
+      (let [^CompletableFuture waiting
+            (session/exclusive
+             current-session :network :network
+             (fn [_]
+               (let [waiting (CompletableFuture/supplyAsync
+                              (reify Supplier
+                                (get [_] (session/shared current-worker snapshot :model (constantly :entered)))))]
+                 (is (thrown? TimeoutException (.get waiting (long 200) TimeUnit/MILLISECONDS)))
+                 (is (= :same-thread (session/exclusive current-session :trainer :trainer
+                                                        (constantly :same-thread))))
+                 waiting)))]
+        (is (= :entered (.get waiting (long 5) TimeUnit/SECONDS))))
+      (is (= :session/exclusive-inside-shared
+             (error-code #(session/shared current-session :network :network
+                                          (fn [_] (session/exclusive current-session :trainer :trainer identity))))))
+      (is (.isEmpty recording))
+      ;; Releasing the network first releases everything registered after it, latest first.
+      (session/release! current-session :network)
+      (is (= [:snapshot :trainer :network] (vec recording)))
+      (is (= [] (session/resources current-session)))
+      (is (= :session/released (error-code #(session/shared current-session trainer :trainer identity)))))
+    (let [recording (ConcurrentLinkedQueue.)]
+      (session/register! current-session (recorded-resource recording :first-network) {:kind :network :name :network})
+      (session/register! current-session (recorded-resource recording :trainer) {:kind :trainer :after :network})
+      (session/register! current-session (recorded-resource recording :second-network)
+                         {:kind :network :name :network :replace? true})
+      (is (= [:trainer :first-network] (vec recording)))
+      (is (= [:network] (mapv :name (session/resources current-session)))))))
 
 (deftest materialized-table-identifiers-remain-generated-only
   (with-open [current-session (session/open)]
